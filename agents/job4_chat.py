@@ -1,0 +1,392 @@
+"""Job 4 — Conversational Trading Assistant.
+
+Claude Sonnet with tool use. Runs inside the Slack bot as threaded conversations.
+
+Each Slack thread maintains its own conversation history. Claude can call tools
+to fetch live data, then propose orders that go through the normal approval flow.
+
+Supported order types via propose_order tool:
+  Long / Short  — open new position
+  Exit          — fully close a position (requires ticket)
+  Trim          — partially close (requires ticket)
+  SetSL         — set/update stop loss (requires ticket + sl)
+  SetTP         — set/update take profit (requires ticket + tp)
+  SetSLTP       — set both SL and TP (requires ticket + sl + tp)
+"""
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import anthropic
+
+import config
+from utils.logger import get_logger
+
+_anthropic_client: anthropic.Anthropic | None = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    return _anthropic_client
+
+logger = get_logger(__name__)
+
+# ── conversation state ────────────────────────────────────────────────────────
+
+# thread_ts → {"messages": [...], "last_active": datetime}
+_threads: dict[str, dict] = {}
+_THREAD_EXPIRY_HOURS = 2
+
+
+def get_active_thread_ids() -> set[str]:
+    """Return set of currently active thread IDs (for Slack bot routing)."""
+    _cleanup_threads()
+    return set(_threads.keys())
+
+
+def _cleanup_threads() -> None:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=_THREAD_EXPIRY_HOURS)
+    expired = [ts for ts, t in _threads.items() if t["last_active"] < cutoff]
+    for ts in expired:
+        del _threads[ts]
+
+
+# ── system prompt ─────────────────────────────────────────────────────────────
+
+_SYSTEM = """\
+You are a professional EUR/USD trading assistant integrated with MetaTrader5.
+You help the user understand current market conditions, analyse open positions,
+and make informed trading decisions.
+
+You have tools to fetch live data. Use them when the user asks about current
+conditions — don't rely on your training data for prices or news.
+
+When the user wants to take a trading action, use propose_order to create a
+formal proposal. The user will approve or reject it via the Slack bot.
+
+Supported actions:
+  Long / Short  — open a new position
+  Exit          — fully close a position (requires ticket)
+  Trim          — partially close (requires ticket)
+  SetSL         — update stop loss (requires ticket + sl price)
+  SetTP         — update take profit (requires ticket + tp price)
+  SetSLTP       — set both SL and TP (requires ticket + sl + tp)
+
+Be concise but precise. Reference specific prices and data in your analysis.
+Always highlight key risks. When proposing orders, explain the rationale clearly.
+"""
+
+# ── tool definitions ──────────────────────────────────────────────────────────
+
+_TOOLS = [
+    {
+        "name": "get_positions",
+        "description": "Get all currently open EURUSD positions from MT5 including ticket, direction, volume, open price, current price, P&L, SL, and TP.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_account",
+        "description": "Get account summary: equity, balance, free margin, margin level, drawdown.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_news",
+        "description": "Get recent EUR/USD news articles scored by market relevance (1-10).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hours": {
+                    "type": "integer",
+                    "description": "How many hours back to look (default 6, max 24)",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_market_context",
+        "description": "Get full market context: recent EURUSD prices, correlated asset prices (DXY, Gold, US10Y, SP500, VIX), key technical levels, and upcoming economic events.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_pending_signals",
+        "description": "Get signals currently pending approval in the signal store.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "propose_order",
+        "description": (
+            "Propose a trading action for user approval. "
+            "Saves a pending signal to the store and returns the signal ID. "
+            "The user must approve it with 'approve <ID>' before it executes on MT5."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["Long", "Short", "Exit", "Trim", "SetSL", "SetTP", "SetSLTP"],
+                    "description": "The trading action",
+                },
+                "ticket": {
+                    "type": "integer",
+                    "description": "MT5 position ticket (required for Exit/Trim/SetSL/SetTP/SetSLTP)",
+                },
+                "sl": {
+                    "type": "number",
+                    "description": "Stop loss price (for SetSL, SetSLTP, Long, Short)",
+                },
+                "tp": {
+                    "type": "number",
+                    "description": "Take profit price (for SetTP, SetSLTP, Long, Short)",
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": ["High", "Medium", "Low"],
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Brief explanation for this action",
+                },
+            },
+            "required": ["action", "confidence", "rationale"],
+        },
+    },
+]
+
+
+# ── tool implementations ──────────────────────────────────────────────────────
+
+def _tool_get_positions() -> str:
+    try:
+        from mt5.connector import is_connected
+        from mt5.position_reader import get_open_positions, get_current_tick
+        if not is_connected():
+            return "MT5 is not connected."
+        positions = get_open_positions(symbol=config.MT5_SYMBOL)
+        if not positions:
+            return "No open EURUSD positions."
+        tick = get_current_tick()
+        lines = [f"Open EURUSD positions ({len(positions)}):"]
+        for p in positions:
+            pip = 0.0001
+            direction = p["type"].upper()
+            pips = (p["current_price"] - p["open_price"]) / pip if direction == "BUY" \
+                else (p["open_price"] - p["current_price"]) / pip
+            lines.append(
+                f"  #{p['ticket']} {direction} {p['volume']}L @ {p['open_price']} "
+                f"| Now: {p['current_price']} | P&L: ${p['profit']:.2f} ({pips:+.1f}pips) "
+                f"| SL: {p['sl'] or 'None'} TP: {p['tp'] or 'None'}"
+            )
+        if tick:
+            lines.append(f"Current: Bid={tick['bid']} Ask={tick['ask']}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error fetching positions: {e}"
+
+
+def _tool_get_account() -> str:
+    try:
+        from mt5.connector import is_connected
+        from mt5.position_reader import get_account_summary
+        if not is_connected():
+            return "MT5 is not connected."
+        a = get_account_summary()
+        equity = a.get("equity")
+        balance = a.get("balance")
+        drawdown = None
+        if equity and balance and balance > 0:
+            drawdown = round((balance - equity) / balance * 100, 2)
+        return (
+            f"Account: equity=${equity} balance=${balance} "
+            f"free_margin=${a.get('free_margin')} "
+            f"margin_level={a.get('margin_level')}% "
+            f"drawdown={drawdown}%"
+        )
+    except Exception as e:
+        return f"Error fetching account: {e}"
+
+
+def _tool_get_news(hours: int = 6) -> str:
+    try:
+        from triage.intraday_logger import read_today_intraday
+        records = read_today_intraday()
+        if not records:
+            return "No news articles recorded today."
+
+        from utils.date_utils import to_est
+        cutoff_est = to_est(datetime.now(timezone.utc) - timedelta(hours=min(hours, 24)))
+        cutoff_str = cutoff_est.strftime("%H:%M")
+
+        # Filter by EST time string stored in records
+        recent = [r for r in records if r.get("time", "00:00") >= cutoff_str]
+        if not recent:
+            recent = records  # fall back to all today's articles
+
+        # Sort by score descending, take top 15
+        recent.sort(key=lambda x: x.get("triage_score") or 0, reverse=True)
+        lines = [f"Recent EUR/USD news (top {min(15, len(recent))} by score, last {hours}h):"]
+        for r in recent[:15]:
+            score = r.get("triage_score", "?")
+            headline = r.get("headline", "")
+            tag = r.get("triage_tag", "")
+            time = r.get("time", "")
+            triggered = " ★" if r.get("triggered_full_analysis") else ""
+            lines.append(f"  [{score}] {time} {headline} ({tag}){triggered}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error fetching news: {e}"
+
+
+def _tool_get_market_context() -> str:
+    try:
+        from analysis.context_builder import build_context
+        ctx = build_context(trigger_item=None)
+        # Cap at 3000 chars to keep token usage reasonable
+        return ctx[:3000] + ("\n...[truncated]" if len(ctx) > 3000 else "")
+    except Exception as e:
+        return f"Error building market context: {e}"
+
+
+def _tool_get_pending_signals() -> str:
+    try:
+        from pipeline.signal_store import list_signals
+        pending = list_signals(status="pending")
+        if not pending:
+            return "No pending signals."
+        lines = [f"Pending signals ({len(pending)}):"]
+        for s in pending:
+            lines.append(
+                f"  [{s['id']}] {s.get('signal')} [{s.get('confidence')}] "
+                f"source={s.get('source')} created={s.get('created_at','')[:16]}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error fetching signals: {e}"
+
+
+def _tool_propose_order(inputs: dict, new_proposals: list[str]) -> str:
+    try:
+        from pipeline.signal_store import save_pending_signal
+        action = inputs["action"]
+        signal = {
+            "signal":       action,
+            "confidence":   inputs.get("confidence", "Medium"),
+            "time_horizon": "Intraday",
+            "rationale":    inputs.get("rationale", ""),
+            "key_levels": {
+                "support":    inputs.get("sl"),
+                "resistance": inputs.get("tp"),
+            },
+            "invalidation":  "",
+            "risk_note":     "",
+            "generated_at":  datetime.now(timezone.utc).isoformat(),
+            "_ticket":       inputs.get("ticket"),
+            "_source":       "job4",
+            "sl":            inputs.get("sl"),
+            "tp":            inputs.get("tp"),
+        }
+        signal_id = save_pending_signal(signal, source="job4")
+        signal["_signal_id"] = signal_id
+        new_proposals.append(signal_id)
+        logger.info(f"Job 4 proposed order: {signal_id} — {action}")
+        return (
+            f"Order proposed. Signal ID: {signal_id}. "
+            f"Tell the user to approve with: approve {signal_id}"
+        )
+    except Exception as e:
+        return f"Error proposing order: {e}"
+
+
+def _execute_tool(
+    name: str,
+    inputs: dict[str, Any],
+    new_proposals: list[str],
+) -> str:
+    if name == "get_positions":
+        return _tool_get_positions()
+    elif name == "get_account":
+        return _tool_get_account()
+    elif name == "get_news":
+        return _tool_get_news(hours=inputs.get("hours", 6))
+    elif name == "get_market_context":
+        return _tool_get_market_context()
+    elif name == "get_pending_signals":
+        return _tool_get_pending_signals()
+    elif name == "propose_order":
+        return _tool_propose_order(inputs, new_proposals)
+    else:
+        return f"Unknown tool: {name}"
+
+
+# ── main chat function ────────────────────────────────────────────────────────
+
+def chat(thread_ts: str, user_message: str) -> tuple[str, list[str]]:
+    """
+    Process a user message in a conversation thread.
+    Returns (assistant_reply, list_of_new_signal_ids_proposed).
+    """
+    _cleanup_threads()
+
+    if thread_ts not in _threads:
+        _threads[thread_ts] = {
+            "messages":    [],
+            "last_active": datetime.now(timezone.utc),
+        }
+
+    thread = _threads[thread_ts]
+    thread["last_active"] = datetime.now(timezone.utc)
+    thread["messages"].append({"role": "user", "content": user_message})
+
+    client = _get_client()
+    messages = list(thread["messages"])
+    new_proposals: list[str] = []
+    final_reply = ""
+
+    # Agentic loop — keep going until end_turn or no more tool calls
+    while True:
+        response = client.messages.create(
+            model=config.ANALYSIS_MODEL,
+            max_tokens=1024,
+            system=_SYSTEM,
+            tools=_TOOLS,
+            messages=messages,
+        )
+
+        if response.stop_reason == "end_turn":
+            for block in response.content:
+                if hasattr(block, "text"):
+                    final_reply = block.text
+            break
+
+        elif response.stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    result = _execute_tool(block.name, block.input, new_proposals)
+                    logger.debug(f"Tool {block.name} → {result[:100]}")
+                    tool_results.append({
+                        "type":        "tool_result",
+                        "tool_use_id": block.id,
+                        "content":     result,
+                    })
+            messages.append({"role": "user", "content": tool_results})
+
+        else:
+            # Unexpected stop reason — extract any text and break
+            for block in response.content:
+                if hasattr(block, "text"):
+                    final_reply = block.text
+            break
+
+    # Save only the final assistant text to thread history
+    if final_reply:
+        thread["messages"].append({"role": "assistant", "content": final_reply})
+
+    return final_reply, new_proposals

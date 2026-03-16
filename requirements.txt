@@ -1,0 +1,34 @@
+# EUR/USD AI Trading Agent — Python dependencies
+#
+# Step 1 — Create and activate the conda environment:
+#   conda create -n mt5_env python=3.10
+#   conda activate mt5_env
+#
+# Step 2 — Install all dependencies:
+#   pip install -r requirements.txt
+#
+# Note: MetaTrader5 is Windows-only. On other operating systems this
+# package will fail to install and the MT5 features will not work.
+
+
+# ── AI ─────────────────────────────────────────────────────────────────────────
+anthropic>=0.84.0
+
+# ── Slack bot ──────────────────────────────────────────────────────────────────
+slack-bolt>=1.27.0
+slack-sdk>=3.41.0
+
+# ── Data & HTTP ────────────────────────────────────────────────────────────────
+requests>=2.31.0
+yfinance>=1.0.0
+pandas>=2.0.0
+numpy>=1.26.0
+
+# ── HTML parsing (ForexFactory calendar) ──────────────────────────────────────
+beautifulsoup4>=4.12.0
+
+# ── MetaTrader 5 (Windows only) ────────────────────────────────────────────────
+MetaTrader5>=5.0.0
+
+# ── Environment ────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
