@@ -1,0 +1,1 @@
+# eurusd_trading_bot
