@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 import config
 from utils.logger import get_logger
+from utils.retry import call_with_retry
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -51,7 +52,17 @@ Provide your analysis in the following JSON format:
   "rationale": "2-3 sentence explanation referencing specific data points",
   "key_levels": {{"support": 0.0000, "resistance": 0.0000}},
   "invalidation": "What would prove this signal wrong",
-  "risk_note": "Any asymmetric risks or upcoming events that could disrupt"
+  "risk_note": "Any asymmetric risks or upcoming events that could disrupt",
+  "price_snapshot": {{
+    "current": 0.0000,
+    "session_open": 0.0000,
+    "session_high": 0.0000,
+    "session_low": 0.0000,
+    "session_change_pct": "+0.00%",
+    "trend": "short one-line description of current technical trend"
+  }},
+  "today_summary": "1-2 sentences: what drove price action today, key news/events",
+  "week_summary": "1-2 sentences: past week's price trend, dominant themes, net move"
 }}
 
 Return ONLY valid JSON, no other text."""
@@ -66,7 +77,8 @@ def run_full_analysis(context_window: str) -> dict[str, Any]:
 
     try:
         client = _get_client()
-        message = client.messages.create(
+        message = call_with_retry(
+            client.messages.create,
             model=config.ANALYSIS_MODEL,
             max_tokens=1024,
             system=_SYSTEM,
@@ -74,7 +86,7 @@ def run_full_analysis(context_window: str) -> dict[str, Any]:
         )
         raw = message.content[0].text.strip()
     except Exception as e:
-        logger.error(f"Full analysis LLM call failed: {e}")
+        logger.error(f"Full analysis LLM call failed after retries: {e}")
         return {
             "signal": "Wait",
             "confidence": "Low",

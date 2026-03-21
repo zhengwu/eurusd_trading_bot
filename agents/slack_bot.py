@@ -38,6 +38,8 @@ logger = get_logger(__name__)
 _HELP_TEXT = (
     "*EUR/USD Agent Commands*\n"
     "> `scan` / `update` — force an immediate news scan (bypasses market hours)\n"
+    "> `analyze` / `outlook` — full market analysis: news + prices + technicals → trading signal\n"
+    "> `chat` — run full analysis, then open a conversation seeded with the results\n"
     "> `positions` — run Job 2 position check now\n"
     "> `status` — show system status (cooldown, MT5, pending signals)\n"
     "> `collect` — trigger end-of-day data collection\n"
@@ -75,6 +77,134 @@ def _do_scan(say: Callable) -> None:
         )
     else:
         say(":white_check_mark: Scan complete — no high-score articles found.")
+
+
+def _do_analyze(say: Callable) -> None:
+    """Run the full Job 1 analysis pipeline on demand, bypassing news triage."""
+    say(":brain: Running full market analysis (news + prices + technicals)…")
+    try:
+        from analysis.context_builder import build_context
+        from analysis.full_analysis_prompt import run_full_analysis
+        from analysis.signal_formatter import format_signal
+        from notifications.notifier import notify
+
+        context = build_context(trigger_item=None)
+        raw_signal = run_full_analysis(context)
+        signal = format_signal(raw_signal)
+
+        if signal.get("signal") in ("Long", "Short"):
+            from pipeline.signal_store import save_pending_signal
+            from agents.job3_executor import compute_order_preview
+            preview = compute_order_preview(signal)
+            if preview:
+                signal["_order_preview"] = preview
+            signal_id = save_pending_signal(signal, source="manual")
+            signal["_signal_id"] = signal_id
+            signal["_source"] = "manual"
+
+        notify(signal, trigger_item=None)
+        action = signal.get("signal", "Hold")
+        confidence = signal.get("confidence", "")
+        say(
+            f":white_check_mark: Analysis complete — *{action}* [{confidence}]. "
+            "Check above for the full signal."
+        )
+    except Exception as e:
+        logger.error(f"On-demand analysis failed: {e}", exc_info=True)
+        say(f":x: Analysis failed: {e}")
+
+
+def _do_chat_command(say: Callable, thread_ts: str) -> None:
+    """Start an analysis-seeded chat session in the given Slack thread."""
+    say(":brain: Running full market analysis to brief you…")
+    try:
+        from analysis.context_builder import build_context
+        from analysis.full_analysis_prompt import run_full_analysis
+        from analysis.signal_formatter import format_signal
+        from agents.job4_chat import seed_thread
+
+        context = build_context(trigger_item=None)
+        raw_signal = run_full_analysis(context)
+        signal = format_signal(raw_signal)
+
+        action     = signal.get("signal", "Wait")
+        confidence = signal.get("confidence", "")
+        horizon    = signal.get("time_horizon", "")
+        rationale  = signal.get("rationale", "")
+        levels     = signal.get("key_levels", {})
+        invalidate = signal.get("invalidation", "")
+        risk       = signal.get("risk_note", "")
+        today_sum  = signal.get("today_summary", "")
+        week_sum   = signal.get("week_summary", "")
+        snap       = signal.get("price_snapshot") or {}
+
+        support    = levels.get("support", "—")
+        resistance = levels.get("resistance", "—")
+
+        # Price snapshot line
+        price_line = ""
+        if snap.get("current"):
+            price_line = (
+                f"*Price:* `{snap['current']}`"
+                + (f"  Open `{snap['session_open']}`  "
+                   f"H `{snap['session_high']}`  L `{snap['session_low']}`  "
+                   f"{snap.get('session_change_pct', '')}" if snap.get("session_open") else "")
+                + (f"\n*Trend:* {snap['trend']}" if snap.get("trend") else "")
+                + "\n"
+            )
+
+        briefing = (
+            f"*EUR/USD Market Analysis*\n\n"
+            + (price_line)
+            + (f"*Today:* {today_sum}\n" if today_sum else "")
+            + (f"*This week:* {week_sum}\n" if week_sum else "")
+            + f"\n*Signal:* {action} [{confidence}] | {horizon}\n"
+            f"*Rationale:* {rationale}\n"
+            f"*Key levels:* Support `{support}` | Resistance `{resistance}`\n"
+            + (f"*Invalidation:* {invalidate}\n" if invalidate else "")
+            + (f"*Risk note:* {risk}\n" if risk else "")
+        )
+
+        # Seed the Job 4 thread so Claude has the analysis in its history
+        seed_thread(thread_ts, briefing)
+
+        # Save Long/Short signals to the pending store
+        if action in ("Long", "Short"):
+            from pipeline.signal_store import save_pending_signal
+            from agents.job3_executor import compute_order_preview
+            preview = compute_order_preview(signal)
+            if preview:
+                signal["_order_preview"] = preview
+            signal_id = save_pending_signal(signal, source="manual")
+            signal["_signal_id"] = signal_id
+            preview = signal.get("_order_preview") or {}
+            order_line = ""
+            if preview:
+                order_line = (
+                    f"\n*Order Details:*"
+                    + (" _(live)_" if preview.get("live_price") else " _(estimated)_") + "\n"
+                    f">Entry `{preview.get('entry_price')}`  "
+                    f"SL `{preview.get('sl')}` (-{preview.get('sl_pips')}p)  "
+                    f"TP `{preview.get('tp')}` (+{preview.get('tp_pips')}p)\n"
+                    f">Lot `{preview.get('lot_size')}`  "
+                    f"Risk `${preview.get('risk_amount')}`  "
+                    f"R:R `{preview.get('risk_reward')}`"
+                )
+            briefing += (
+                order_line
+                + f"\n:pencil: Signal `{signal_id}` pending."
+                + f" `approve {signal_id}` to execute"
+                + " or ask me to adjust SL/TP/lot."
+            )
+
+        say(
+            briefing
+            + "\n\n_Chat session open. Ask me anything about this analysis or the market. "
+            "Say `end chat` when you're done._"
+        )
+    except Exception as e:
+        logger.error(f"Chat command failed: {e}", exc_info=True)
+        say(f":x: Analysis failed: {e}")
 
 
 def _do_positions(say: Callable) -> None:
@@ -206,6 +336,8 @@ Given a user message, identify the intent and return JSON only.
 
 Possible intents:
 - "scan"       — user wants to scan/fetch/update news or market data
+- "analyze"    — user wants a full market analysis, trading outlook, or trade idea/opportunity
+- "chat"       — user wants to start an interactive chat session seeded with market analysis
 - "positions"  — user wants to check open positions or portfolio
 - "status"     — user wants system status, health check, or overview
 - "collect"    — user wants to collect/save end-of-day data
@@ -263,6 +395,8 @@ def _dispatch(text: str, say: Callable) -> bool:
     # Fast path — exact keyword matching
     if re.fullmatch(r"scan|update", clean):
         _run_in_thread(say, _do_scan)
+    elif re.fullmatch(r"analyze|analyse|analysis|outlook", clean):
+        _run_in_thread(say, _do_analyze)
     elif re.fullmatch(r"positions?", clean):
         _run_in_thread(say, _do_positions)
     elif clean == "status":
@@ -285,6 +419,12 @@ def _dispatch(text: str, say: Callable) -> bool:
         intent, signal_id = _classify_intent(clean)
         if intent == "scan":
             _run_in_thread(say, _do_scan)
+        elif intent == "analyze":
+            _run_in_thread(say, _do_analyze)
+        elif intent == "chat":
+            # NLP can't easily get thread_ts here — fall through to unknown so
+            # the caller's event handler picks it up with proper thread_ts
+            return False
         elif intent == "positions":
             _run_in_thread(say, _do_positions)
         elif intent == "status":
@@ -354,13 +494,22 @@ def _get_app() -> App:
 
             if thread_ts:
                 # Thread reply — route to chat if it's an active chat session
-                from agents.job4_chat import get_active_thread_ids
+                from agents.job4_chat import get_active_thread_ids, close_thread
                 if thread_ts in get_active_thread_ids():
                     tsay = _make_threaded_say(say, thread_ts)
-                    _run_in_thread(tsay, _do_chat, thread_ts, text)
+                    if re.search(r"\bend\s+chat\b", text.lower()):
+                        close_thread(thread_ts)
+                        tsay(":wave: Chat session ended. Start a new one anytime with `chat`.")
+                    else:
+                        _run_in_thread(tsay, _do_chat, thread_ts, text)
             elif is_dm:
-                # DM — try commands first, fall back to chat
-                if not _dispatch(text, say):
+                # DM — check for "chat" command, then try other commands, fall back to chat
+                clean = re.sub(r"\s+", " ", text.strip().lower())
+                if re.fullmatch(r"chat", clean):
+                    dm_thread_ts = event["ts"]
+                    tsay = _make_threaded_say(say, dm_thread_ts)
+                    _run_in_thread(tsay, _do_chat_command, dm_thread_ts)
+                elif not _dispatch(text, say):
                     dm_thread_ts = event["ts"]
                     tsay = _make_threaded_say(say, dm_thread_ts)
                     _run_in_thread(tsay, _do_chat, dm_thread_ts, text)
@@ -373,10 +522,26 @@ def _get_app() -> App:
             text = event.get("text", "")
             thread_ts = event.get("thread_ts") or event["ts"]
             tsay = _make_threaded_say(say, thread_ts)
+            clean = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
+            clean = re.sub(r"\s+", " ", clean).lower()
+
+            # "end chat" — close an active thread
+            if re.search(r"\bend\s+chat\b", clean):
+                from agents.job4_chat import close_thread
+                if close_thread(thread_ts):
+                    tsay(":wave: Chat session ended. Start a new one anytime with `chat`.")
+                else:
+                    tsay(":grey_question: No active chat session to end.")
+                return
 
             # @mention inside a thread → always continue/start chat in that thread
             if event.get("thread_ts"):
                 _run_in_thread(tsay, _do_chat, thread_ts, text)
+                return
+
+            # "chat" command at top level → start analysis-seeded chat
+            if re.fullmatch(r"chat", clean):
+                _run_in_thread(tsay, _do_chat_command, thread_ts)
                 return
 
             # Top-level @mention → try commands first, fall back to chat

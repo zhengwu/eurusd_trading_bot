@@ -136,7 +136,11 @@ def _run_scan_locked() -> list[dict]:
 
         # Save actionable signals to pending store for Job 3 approval
         if signal.get("signal") in ("Long", "Short"):
-            from pipeline.signal_store import save_pending_signal
+            from pipeline.signal_store import save_pending_signal, update_signal
+            from agents.job3_executor import compute_order_preview
+            preview = compute_order_preview(signal)
+            if preview:
+                signal["_order_preview"] = preview
             signal_id = save_pending_signal(signal, source="job1")
             signal["_signal_id"] = signal_id
             signal["_source"] = "job1"

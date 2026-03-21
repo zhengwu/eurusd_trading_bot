@@ -13,11 +13,39 @@ Usage:
 """
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
+
+
+def _disable_quickedit() -> None:
+    """
+    Disable Windows Console QuickEdit mode.
+
+    QuickEdit is a Windows console feature that freezes the entire process
+    (all threads) when the user clicks in the terminal window. This is fatal
+    for a multi-threaded daemon: a stray click pauses the scanner, Slack bot,
+    and position monitor until Enter is pressed.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.wintypes.DWORD()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            ENABLE_EXTENDED_FLAGS = 0x0080
+            ENABLE_QUICK_EDIT_MODE = 0x0040
+            # Keep extended flags on, clear QuickEdit
+            new_mode = (mode.value | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE
+            kernel32.SetConsoleMode(handle, new_mode)
+    except Exception:
+        pass  # Not a console (e.g. piped output) — no action needed
 
 load_dotenv()
 
@@ -75,6 +103,7 @@ def _job2_thread() -> None:
 
 
 def main() -> None:
+    _disable_quickedit()
     logger.info("=" * 60)
     logger.info("EUR/USD Opportunity Scanner — Job 1")
     logger.info(f"  Triage model  : {config.TRIAGE_MODEL}")

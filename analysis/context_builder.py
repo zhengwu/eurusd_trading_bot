@@ -175,8 +175,38 @@ def build_context(trigger_item: dict | None = None) -> str:
             )
     sections.append("=== PAST 7 DAYS (summaries) ===\n" + "\n\n".join(past_parts) + "\n")
 
-    # ── 30-DAY PRICE TREND ────────────────────────────────────────────────────
-    price_rows: list[str] = [
+    # ── PRICE SUMMARY (live + technicals + correlated assets) ────────────────
+    try:
+        from pipeline.price_agent import get_price_summary
+        price_summary = get_price_summary()
+    except Exception as e:
+        logger.warning(f"Price agent failed — falling back to raw table: {e}")
+        price_summary = _fallback_price_table(data_dir)
+
+    sections.append(price_summary + "\n")
+
+    # ── enforce token budget (trim the price summary if needed) ───────────────
+    def _assemble():
+        return "\n".join(sections)
+
+    full = _assemble()
+    # If over budget, truncate the price summary (keep first CONTEXT_MAX_TOKENS*4 chars)
+    if _estimate_tokens(full) > config.CONTEXT_MAX_TOKENS:
+        budget_chars = config.CONTEXT_MAX_TOKENS * _CHARS_PER_TOKEN
+        used = sum(len(s) for s in sections[:-1])
+        remaining = max(budget_chars - used, 500)
+        sections[-1] = price_summary[:remaining] + "\n...[price summary truncated]\n"
+        full = _assemble()
+
+    token_est = _estimate_tokens(full)
+    logger.info(f"Context assembled: ~{token_est} tokens")
+    return full
+
+
+def _fallback_price_table(data_dir: Path) -> str:
+    """Raw 30-day closing price table — used if price_agent fails."""
+    rows: list[str] = [
+        "=== 30-DAY PRICE TREND (fallback — no live data) ===",
         "Date       | EURUSD   | DXY     | US10Y  | Gold    | VIX",
         "-" * 65,
     ]
@@ -184,20 +214,5 @@ def build_context(trigger_item: dict | None = None) -> str:
         date_str = (datetime.now(timezone.utc).date() - timedelta(days=i)).isoformat()
         prices = _read_json(data_dir / date_str / "prices.json")
         if prices:
-            price_rows.append(_fmt_price_table_row(date_str, prices))
-
-    sections.append("=== 30-DAY PRICE TREND ===\n" + "\n".join(price_rows) + "\n")
-
-    # ── enforce token budget (trim oldest price rows first) ───────────────────
-    def _assemble():
-        return "\n".join(sections)
-
-    full = _assemble()
-    while _estimate_tokens(full) > config.CONTEXT_MAX_TOKENS and len(price_rows) > 3:
-        price_rows.pop()  # remove oldest row (list is most-recent-first)
-        sections[-1] = "=== 30-DAY PRICE TREND ===\n" + "\n".join(price_rows) + "\n"
-        full = _assemble()
-
-    token_est = _estimate_tokens(full)
-    logger.info(f"Context assembled: ~{token_est} tokens ({len(price_rows) - 2} price rows)")
-    return full
+            rows.append(_fmt_price_table_row(date_str, prices))
+    return "\n".join(rows)

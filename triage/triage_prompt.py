@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 import config
 from utils.logger import get_logger
+from utils.retry import call_with_retry
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -69,7 +70,8 @@ def triage_headlines(headlines: list[str]) -> list[dict[str, Any]]:
 
     try:
         client = _get_client()
-        message = client.messages.create(
+        message = call_with_retry(
+            client.messages.create,
             model=config.TRIAGE_MODEL,
             max_tokens=1024,
             system=_SYSTEM,
@@ -77,7 +79,7 @@ def triage_headlines(headlines: list[str]) -> list[dict[str, Any]]:
         )
         raw = message.content[0].text.strip()
     except Exception as e:
-        logger.error(f"Triage LLM call failed: {e}")
+        logger.error(f"Triage LLM call failed after retries: {e}")
         return [
             {"headline": h, "score": 5, "tag": "other", "reason": "triage unavailable"}
             for h in headlines

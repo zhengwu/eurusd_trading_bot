@@ -150,6 +150,22 @@ def mark_executed(signal_id: str, execution_result: dict) -> None:
                 return
 
 
+def update_signal(signal_id: str, updates: dict[str, Any]) -> bool:
+    """
+    Update fields of a pending signal (e.g. sl, tp, lot_size, _order_preview).
+    Returns True if the signal was found and updated.
+    """
+    with _lock:
+        signals = _load()
+        for s in signals:
+            if s.get("id", "").upper() == signal_id.upper() and s.get("status") == "pending":
+                s.update(updates)
+                _save(signals)
+                logger.info(f"Signal {signal_id} updated: {list(updates.keys())}")
+                return True
+        return False
+
+
 def expire_old_signals() -> int:
     """Mark expired pending signals. Returns count expired."""
     with _lock:

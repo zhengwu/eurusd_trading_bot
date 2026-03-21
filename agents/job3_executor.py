@@ -147,6 +147,63 @@ def _get_equity() -> float | None:
         return None
 
 
+def compute_order_preview(signal: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Compute the full order details for a pending Long/Short signal:
+    entry price, SL, TP, lot size, risk amount, R:R ratio.
+
+    Returns a dict with these fields, or None if MT5 is unavailable.
+    Falls back to key_levels from the signal if no live tick.
+    """
+    action = signal.get("signal")
+    if action not in ("Long", "Short"):
+        return None
+
+    try:
+        direction = "buy" if action == "Long" else "sell"
+
+        # Try live tick first, fall back gracefully
+        tick = get_current_tick() if is_connected() else None
+        if tick:
+            current_price = tick["ask"] if direction == "buy" else tick["bid"]
+        else:
+            # Estimate from key_levels midpoint
+            levels = signal.get("key_levels") or {}
+            sup = levels.get("support")
+            res = levels.get("resistance")
+            if sup and res:
+                current_price = round((float(sup) + float(res)) / 2, 5)
+            else:
+                return None  # can't compute without any price reference
+
+        sl_price, tp_price = calculate_sl_tp(signal, current_price, direction)
+        sl_pips = sl_pips_from_price(sl_price, current_price, direction)
+        if sl_pips < 1:
+            sl_pips = config.JOB3_DEFAULT_SL_PIPS
+
+        equity = _get_equity()
+        lot = calculate_lot_size(equity or 10000.0, config.JOB3_RISK_PCT, sl_pips)
+        risk_amount = round((equity or 0) * config.JOB3_RISK_PCT / 100, 2)
+
+        tp_pips = abs(tp_price - current_price) / 0.0001 if tp_price else None
+        rr = round(tp_pips / sl_pips, 2) if tp_pips and sl_pips > 0 else None
+
+        return {
+            "entry_price": round(current_price, 5),
+            "sl":          round(sl_price, 5) if sl_price else None,
+            "tp":          round(tp_price, 5) if tp_price else None,
+            "sl_pips":     round(sl_pips, 1),
+            "tp_pips":     round(tp_pips, 1) if tp_pips else None,
+            "lot_size":    lot,
+            "risk_amount": risk_amount,
+            "risk_reward": f"1:{rr}" if rr else None,
+            "live_price":  tick is not None,
+        }
+    except Exception as e:
+        logger.warning(f"compute_order_preview failed: {e}")
+        return None
+
+
 def run_executor_once() -> int:
     """
     Find all approved signals and execute them.

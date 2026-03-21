@@ -36,6 +36,10 @@ def format_signal(raw: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(key_levels, dict):
         key_levels = {}
 
+    price_snapshot = raw.get("price_snapshot") or {}
+    if not isinstance(price_snapshot, dict):
+        price_snapshot = {}
+
     return {
         "signal": signal,
         "confidence": confidence,
@@ -47,5 +51,15 @@ def format_signal(raw: dict[str, Any]) -> dict[str, Any]:
         },
         "invalidation": str(raw.get("invalidation", "")),
         "risk_note": str(raw.get("risk_note", "")),
+        "price_snapshot": {
+            "current":          price_snapshot.get("current"),
+            "session_open":     price_snapshot.get("session_open"),
+            "session_high":     price_snapshot.get("session_high"),
+            "session_low":      price_snapshot.get("session_low"),
+            "session_change_pct": price_snapshot.get("session_change_pct", ""),
+            "trend":            str(price_snapshot.get("trend", "")),
+        },
+        "today_summary": str(raw.get("today_summary", "")),
+        "week_summary":  str(raw.get("week_summary", "")),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

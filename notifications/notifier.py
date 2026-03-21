@@ -39,6 +39,16 @@ def _format_alert(signal: dict[str, Any], trigger_item: dict[str, Any] | None = 
         tag = trigger_item.get("tag") or trigger_item.get("triage_tag", "")
         trigger_line = f"\nTrigger  : [{score}] {headline} ({tag})\n"
 
+    snap = signal.get("price_snapshot") or {}
+    current     = snap.get("current", "N/A")
+    sess_open   = snap.get("session_open", "N/A")
+    sess_high   = snap.get("session_high", "N/A")
+    sess_low    = snap.get("session_low", "N/A")
+    sess_chg    = snap.get("session_change_pct", "")
+    trend_lbl   = snap.get("trend", "")
+    today_sum   = signal.get("today_summary", "")
+    week_sum    = signal.get("week_summary", "")
+
     return (
         f"{'═' * 55}\n"
         f"  EUR/USD SIGNAL ALERT — {now}\n"
@@ -47,13 +57,35 @@ def _format_alert(signal: dict[str, Any], trigger_item: dict[str, Any] | None = 
         f"  Confidence : {signal.get('confidence', 'N/A')}\n"
         f"  Horizon    : {signal.get('time_horizon', 'N/A')}\n"
         f"{trigger_line}"
-        f"\n  Rationale:\n  {signal.get('rationale', '')}\n"
+        f"\n  Price Snapshot:\n"
+        f"    Current    : {current}\n"
+        f"    Session    : Open {sess_open}  H {sess_high}  L {sess_low}  {sess_chg}\n"
+        + (f"    Trend      : {trend_lbl}\n" if trend_lbl else "")
+        + (f"\n  Today:\n  {today_sum}\n" if today_sum else "")
+        + (f"\n  This Week:\n  {week_sum}\n" if week_sum else "")
+        + f"\n  Rationale:\n  {signal.get('rationale', '')}\n"
         f"\n  Key Levels:\n"
         f"    Support    : {support}\n"
         f"    Resistance : {resistance}\n"
         f"\n  Invalidation:\n  {signal.get('invalidation', '')}\n"
         f"\n  Risk Note:\n  {signal.get('risk_note', '')}\n"
-        f"{'═' * 55}"
+        + _fmt_order_preview(signal.get("_order_preview"))
+        + f"{'═' * 55}"
+    )
+
+
+def _fmt_order_preview(preview: dict | None) -> str:
+    if not preview:
+        return ""
+    src = " (live)" if preview.get("live_price") else " (estimated)"
+    return (
+        f"\n  Order Details{src}:\n"
+        f"    Entry      : {preview.get('entry_price', '—')}\n"
+        f"    SL         : {preview.get('sl', '—')}  (-{preview.get('sl_pips', '—')} pips)\n"
+        f"    TP         : {preview.get('tp', '—')}  (+{preview.get('tp_pips', '—')} pips)\n"
+        f"    Lot        : {preview.get('lot_size', '—')}\n"
+        f"    Risk       : ${preview.get('risk_amount', '—')}\n"
+        f"    R:R        : {preview.get('risk_reward', '—')}\n"
     )
 
 
@@ -123,27 +155,77 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
         tag = trigger_item.get("tag") or trigger_item.get("triage_tag", "")
         trigger_line = f"\n>*Trigger* [{score}]: {headline} `{tag}`"
 
-    # Show signal ID + approval instructions if this signal is pending execution
+    # Order preview block
+    order_preview = signal.get("_order_preview") or {}
+    order_line = ""
+    if order_preview:
+        entry  = order_preview.get("entry_price", "—")
+        sl     = order_preview.get("sl", "—")
+        tp     = order_preview.get("tp", "—")
+        sl_p   = order_preview.get("sl_pips", "—")
+        tp_p   = order_preview.get("tp_pips", "—")
+        lot    = order_preview.get("lot_size", "—")
+        risk   = order_preview.get("risk_amount", "—")
+        rr     = order_preview.get("risk_reward", "—")
+        live   = " _(live)_" if order_preview.get("live_price") else " _(estimated)_"
+        order_line = (
+            f"\n\n*Order Details*{live}\n"
+            f">Entry `{entry}`  SL `{sl}` (-{sl_p}p)  TP `{tp}` (+{tp_p}p)\n"
+            f">Lot `{lot}`  Risk `${risk}`  R:R `{rr}`"
+        )
+
+    # Show signal ID + approval / chat instructions
     signal_id = signal.get("_signal_id")
     source = signal.get("_source", "job1")
     approval_line = ""
     if signal_id and signal_label not in ("Wait", "Hold"):
         approval_line = (
-            f"\n\n:white_check_mark: *To execute:* `python -m agents.job3_executor --approve {signal_id}`"
-            f"\n:x: *To reject:*  `python -m agents.job3_executor --reject {signal_id}`"
+            f"\n\n:white_check_mark: *To execute:* `approve {signal_id}`"
+            f"\n:pencil: *To modify SL/TP/lot:* type `chat` and ask me"
+            f"\n:x: *To reject:*  `reject {signal_id}`"
         )
 
     # Source label for Job 2 position alerts
     source_label = " _(Position Monitor)_" if source == "job2" else ""
 
+    snap = signal.get("price_snapshot") or {}
+    current       = snap.get("current")
+    session_open  = snap.get("session_open")
+    session_high  = snap.get("session_high")
+    session_low   = snap.get("session_low")
+    session_chg   = snap.get("session_change_pct", "")
+    trend_label   = snap.get("trend", "")
+
+    price_line = ""
+    if current:
+        price_line = f"\n>*Price:* `{current}`"
+        if session_open:
+            price_line += (
+                f"  Open `{session_open}`  "
+                f"H `{session_high}`  L `{session_low}`  {session_chg}"
+            )
+        if trend_label:
+            price_line += f"\n>*Trend:* {trend_label}"
+
+    today_sum = signal.get("today_summary", "")
+    week_sum  = signal.get("week_summary", "")
+    summary_lines = ""
+    if today_sum:
+        summary_lines += f"\n>*Today:* {today_sum}"
+    if week_sum:
+        summary_lines += f"\n>*This week:* {week_sum}"
+
     text = (
         f"{emoji} *EUR/USD {signal_label}* {confidence_emoji} `{confidence}` — "
         f"_{signal.get('time_horizon', 'N/A')}_{source_label}\n"
-        f"_{now}_{trigger_line}\n\n"
+        f"_{now}_{trigger_line}"
+        f"{price_line}"
+        f"{summary_lines}\n\n"
         f">*Rationale:* {signal.get('rationale', '')}\n\n"
         f">*Key Levels:* Support `{support}` | Resistance `{resistance}`\n"
         f">*Invalidation:* {signal.get('invalidation', '')}\n"
         f">*Risk Note:* {signal.get('risk_note', '')}"
+        f"{order_line}"
         f"{approval_line}"
     )
 

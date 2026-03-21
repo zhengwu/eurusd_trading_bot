@@ -49,6 +49,27 @@ def get_active_thread_ids() -> set[str]:
     return set(_threads.keys())
 
 
+def seed_thread(thread_ts: str, assistant_message: str) -> None:
+    """
+    Pre-populate a thread with an initial assistant message.
+    Used by the `chat` command to inject a market analysis as background
+    before the user asks any questions.
+    """
+    _cleanup_threads()
+    _threads[thread_ts] = {
+        "messages": [{"role": "assistant", "content": assistant_message}],
+        "last_active": datetime.now(timezone.utc),
+    }
+
+
+def close_thread(thread_ts: str) -> bool:
+    """Explicitly close a conversation thread. Returns True if it existed."""
+    if thread_ts in _threads:
+        del _threads[thread_ts]
+        return True
+    return False
+
+
 def _cleanup_threads() -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=_THREAD_EXPIRY_HOURS)
     expired = [ts for ts, t in _threads.items() if t["last_active"] < cutoff]
@@ -117,6 +138,36 @@ _TOOLS = [
         "name": "get_pending_signals",
         "description": "Get signals currently pending approval in the signal store.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "modify_order",
+        "description": (
+            "Modify a pending signal's SL, TP, or lot size before the user approves it. "
+            "Recalculates the order preview (risk amount, R:R) after changes. "
+            "Use this when the user wants to adjust parameters of a pending signal."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "signal_id": {
+                    "type": "string",
+                    "description": "8-char signal ID to modify",
+                },
+                "sl": {
+                    "type": "number",
+                    "description": "New stop loss price",
+                },
+                "tp": {
+                    "type": "number",
+                    "description": "New take profit price",
+                },
+                "lot_size": {
+                    "type": "number",
+                    "description": "Override lot size (bypasses risk-based calculation)",
+                },
+            },
+            "required": ["signal_id"],
+        },
     },
     {
         "name": "propose_order",
@@ -270,6 +321,71 @@ def _tool_get_pending_signals() -> str:
         return f"Error fetching signals: {e}"
 
 
+def _tool_modify_order(inputs: dict) -> str:
+    try:
+        from pipeline.signal_store import get_signal_by_id, update_signal
+        signal_id = inputs.get("signal_id", "").upper()
+        signal = get_signal_by_id(signal_id)
+        if signal is None:
+            return f"Signal {signal_id} not found."
+        if signal.get("status") != "pending":
+            return f"Signal {signal_id} is not pending (status={signal.get('status')}) — cannot modify."
+
+        updates: dict = {}
+        if "sl" in inputs:
+            updates["sl"] = inputs["sl"]
+            levels = dict(signal.get("key_levels") or {})
+            action = signal.get("signal")
+            if action == "Long":
+                levels["support"] = inputs["sl"]
+            else:
+                levels["resistance"] = inputs["sl"]
+            updates["key_levels"] = levels
+        if "tp" in inputs:
+            updates["tp"] = inputs["tp"]
+            levels = dict(signal.get("key_levels") or {})
+            action = signal.get("signal")
+            if action == "Long":
+                levels["resistance"] = inputs["tp"]
+            else:
+                levels["support"] = inputs["tp"]
+            updates["key_levels"] = levels
+        if "lot_size" in inputs:
+            updates["_lot_override"] = inputs["lot_size"]
+
+        if not updates:
+            return "No changes provided — specify sl, tp, or lot_size."
+
+        update_signal(signal_id, updates)
+
+        # Recompute order preview with new values
+        updated_signal = {**signal, **updates}
+        from agents.job3_executor import compute_order_preview
+        preview = compute_order_preview(updated_signal)
+        if preview:
+            if "lot_size" in inputs:
+                preview["lot_size"] = inputs["lot_size"]
+                risk = preview.get("risk_amount", 0)
+                tp_p = preview.get("tp_pips")
+                sl_p = preview.get("sl_pips")
+                if sl_p and tp_p and inputs["lot_size"]:
+                    preview["risk_reward"] = f"1:{round(tp_p / sl_p, 2)}" if sl_p > 0 else "—"
+            update_signal(signal_id, {"_order_preview": preview})
+            return (
+                f"Signal {signal_id} updated.\n"
+                f"Entry: {preview.get('entry_price')}  "
+                f"SL: {preview.get('sl')} (-{preview.get('sl_pips')}p)  "
+                f"TP: {preview.get('tp')} (+{preview.get('tp_pips')}p)\n"
+                f"Lot: {preview.get('lot_size')}  Risk: ${preview.get('risk_amount')}  "
+                f"R:R: {preview.get('risk_reward')}\n"
+                f"Approve with: approve {signal_id}"
+            )
+        update_signal(signal_id, updates)
+        return f"Signal {signal_id} updated with {list(updates.keys())}. Approve with: approve {signal_id}"
+    except Exception as e:
+        return f"Error modifying order: {e}"
+
+
 def _tool_propose_order(inputs: dict, new_proposals: list[str]) -> str:
     try:
         from pipeline.signal_store import save_pending_signal
@@ -318,6 +434,8 @@ def _execute_tool(
         return _tool_get_market_context()
     elif name == "get_pending_signals":
         return _tool_get_pending_signals()
+    elif name == "modify_order":
+        return _tool_modify_order(inputs)
     elif name == "propose_order":
         return _tool_propose_order(inputs, new_proposals)
     else:

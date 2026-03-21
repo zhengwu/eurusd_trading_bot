@@ -13,7 +13,7 @@ ANALYSIS_MODEL = "claude-sonnet-4-6"
 # ── Context window ────────────────────────────────────────────────────────────
 CONTEXT_DAYS_SUMMARY = 7         # Days of summary.md to include
 CONTEXT_DAYS_PRICES = 30         # Days of price trend to include
-CONTEXT_MAX_TOKENS = 6000        # Hard cap — trim older prices first
+CONTEXT_MAX_TOKENS = 10000       # Hard cap — price agent now includes M15 bars + daily table
 
 # ── Market hours (UTC) — scanner only runs during these hours on weekdays ─────
 MARKET_HOURS_START = 7           # 07:00 UTC
