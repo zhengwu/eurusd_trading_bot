@@ -2,16 +2,18 @@
 
 Output format:
   === BREAKING EVENT [HH:MM UTC] ===
-  === TODAY: {date} ===         (full detail: headlines, events, prices)
-  === PAST 7 DAYS (summaries) === (summary.md only — no raw headlines)
-  === 30-DAY PRICE TREND ===    (prices only — no news text)
+  === CURRENT MARKET REGIME ===    (if config.USE_REGIME_ANALYSIS is True)
+  === TODAY: {date} ===            (full detail: headlines, events, prices)
+  === UPCOMING EVENTS (next 48h) ===
+  === PAST 7 DAYS (summaries) ===  (summary.md only — no raw headlines)
+  === 30-DAY PRICE TREND ===       (prices only — no news text)
 
 Enforces CONTEXT_MAX_TOKENS by trimming oldest price rows first.
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +92,43 @@ def _fmt_events(events: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _filter_today_events(events: list[dict], today: str) -> list[dict]:
+    """Return ForexFactory events for today + all FRED historical values."""
+    return [
+        e for e in events
+        if e.get("release_date") == today or e.get("source") == "FRED"
+    ]
+
+
+def _fmt_upcoming_events(events: list[dict], today: str) -> str:
+    """Format ForexFactory events scheduled in the next 48 hours."""
+    tomorrow = (datetime.fromisoformat(today) + timedelta(days=1)).isoformat()
+    day2     = (datetime.fromisoformat(today) + timedelta(days=2)).isoformat()
+    upcoming = [
+        e for e in events
+        if e.get("release_date") in (tomorrow, day2) and e.get("source") == "ForexFactory"
+    ]
+    if not upcoming:
+        return "  (none scheduled in next 48h)"
+    lines = []
+    for e in sorted(upcoming, key=lambda x: x.get("time", "")):
+        try:
+            dt = datetime.fromisoformat(e["time"])
+            time_str = dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            time_str = e.get("release_date", "TBA")
+        impact   = e.get("impact", "").upper()
+        forecast = e.get("forecast")
+        previous = e.get("previous")
+        line = f"  {time_str} | [{impact}] {e.get('event', '')} ({e.get('currency', '')})"
+        if forecast is not None:
+            line += f"  forecast={forecast}"
+        if previous is not None:
+            line += f"  prev={previous}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _fmt_intraday_prices(prices: dict) -> str:
     def _v(asset):
         d = prices.get(asset) or {}
@@ -116,7 +155,7 @@ def _fmt_price_table_row(date_str: str, prices: dict) -> str:
     )
 
 
-def build_context(trigger_item: dict | None = None) -> str:
+def build_context(trigger_item: dict | None = None, symbol: str | None = None) -> str:
     """
     Assemble the full context window string passed to the analysis LLM.
     Trims oldest price rows if total exceeds CONTEXT_MAX_TOKENS.
@@ -148,17 +187,53 @@ def build_context(trigger_item: dict | None = None) -> str:
             f"{', '.join(corroborating[:5]) or '(none)'}\n"
         )
 
+    # ── CURRENT MARKET REGIME ────────────────────────────────────────────────
+    if config.USE_REGIME_ANALYSIS:
+        try:
+            from pipeline.price_agent import get_regime_inputs
+            from pipeline.regime_agent import get_market_regimes
+            sym = symbol or config.MT5_SYMBOL
+            inputs = get_regime_inputs(symbol=sym)
+
+            # Auto-derive macro bias from yield spread; fall back to config if unavailable
+            from pipeline.price_agent import get_macro_bias
+            macro_bias = get_macro_bias(symbol=sym)
+
+            regime_text = get_market_regimes(
+                vix                   = inputs.get("vix"),
+                price                 = inputs.get("price"),
+                sma20                 = inputs.get("sma20"),
+                sma50                 = inputs.get("sma50"),
+                sma200                = inputs.get("sma200"),
+                atr_current           = inputs.get("atr_current"),
+                atr_30d_avg           = inputs.get("atr_30d_avg"),
+                m15_up_bars           = inputs.get("m15_up_bars"),
+                m15_total_bars        = inputs.get("m15_total_bars", 16),
+                pair_realized_vol_pct = inputs.get("pair_realized_vol_pct"),
+                macro_bias            = macro_bias,
+            )
+            sections.append(regime_text + "\n")
+        except Exception as e:
+            logger.warning(f"Regime analysis failed — skipping: {e}")
+
     # ── TODAY ─────────────────────────────────────────────────────────────────
     today_dir = data_dir / today
     intraday = _read_jsonl(today_dir / "intraday.jsonl")
     events = _read_json(today_dir / "events.json") or []
     prices_today = _read_json(today_dir / "prices.json") or {}
 
+    today_events = _filter_today_events(events, today)
     sections.append(
         f"=== TODAY: {today} ===\n"
         f"Intraday news so far:\n{_fmt_intraday_headlines(intraday)}\n\n"
-        f"Events:\n{_fmt_events(events)}\n\n"
+        f"Events:\n{_fmt_events(today_events)}\n\n"
         f"Price action since open:\n{_fmt_intraday_prices(prices_today)}\n"
+    )
+
+    # ── UPCOMING 48H EVENTS ───────────────────────────────────────────────────
+    sections.append(
+        f"=== UPCOMING EVENTS (next 48h) ===\n"
+        f"{_fmt_upcoming_events(events, today)}\n"
     )
 
     # ── PAST 7 DAYS (summaries only) ──────────────────────────────────────────
@@ -178,7 +253,7 @@ def build_context(trigger_item: dict | None = None) -> str:
     # ── PRICE SUMMARY (live + technicals + correlated assets) ────────────────
     try:
         from pipeline.price_agent import get_price_summary
-        price_summary = get_price_summary()
+        price_summary = get_price_summary(symbol=symbol or config.MT5_SYMBOL)
     except Exception as e:
         logger.warning(f"Price agent failed — falling back to raw table: {e}")
         price_summary = _fallback_price_table(data_dir)

@@ -1,6 +1,10 @@
-# EUR/USD AI Trading Agent
+# Forex Multi-Pair Agent
 
-An automated trading assistant for EUR/USD that monitors financial news, watches open positions, and executes trades on MetaTrader 5 — all controlled through Slack.
+An automated trading assistant that monitors multiple currency pairs, watches open positions, and executes trades on MetaTrader 5 — all controlled through Slack.
+
+**Active pairs (default):** EUR/USD · GBP/USD · USD/JPY
+
+Adding or removing pairs requires one line change in `config.py`.
 
 ---
 
@@ -18,21 +22,33 @@ An automated trading assistant for EUR/USD that monitors financial news, watches
 6. [Slack commands](#slack-commands)
 7. [Approval workflow — a full example](#approval-workflow--a-full-example)
 8. [File structure](#file-structure)
-9. [Troubleshooting](#troubleshooting)
+9. [Configuration reference](#configuration-reference)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## What is this?
 
-This is a Python-based AI agent that runs 24/5 (while the forex market is open) and does three things automatically:
+A Python-based AI agent that runs 24/5 (while the forex market is open) and does three things automatically:
 
-1. **Reads the news.** Every 30 minutes it fetches EUR/USD-relevant headlines from multiple financial data providers, scores each one 1–10 for market relevance, and — when something important is detected — runs a deep analysis using Claude Sonnet to generate a trading signal (Long, Short, or Wait).
+1. **Reads the news.** Every 30 minutes it scans financial news for each active pair independently, scores headlines 1–10 for relevance to that specific pair, and — when something important is detected — runs a deep analysis using Claude Sonnet to generate a trading signal (Long, Short, or Wait). Each pair has its own news queries, cooldown timer, and deduplication cache so they never interfere with each other.
 
-2. **Watches your open positions.** Every 30 minutes it connects to your MetaTrader 5 terminal, reads any open EUR/USD trades, and uses Claude Sonnet to recommend whether to Hold, Trim, or Exit each one based on current market conditions.
+2. **Watches your open positions.** Every 30 minutes it reads all open MT5 positions across all active pairs and uses Claude Sonnet to recommend whether to Hold, Trim, or Exit each one based on current market conditions.
 
-3. **Executes trades.** When you approve a signal (via Slack or the command line), the agent places or closes the order on MT5 directly, with position sizing calculated automatically from your account equity.
+3. **Executes trades.** When you approve a signal (via Slack or the command line), the agent places or closes the order on MT5 directly. Position sizing is calculated automatically from your account equity and the stop loss distance — using the correct pip value for each pair (USD-quote pairs vs JPY pairs).
 
-You stay in control. The agent never trades without your approval. Signals arrive in Slack, you type `approve XXXXXXXX`, and the trade executes. You can also reject signals, ask free-form questions, and have a full conversation with the agent about market conditions — all from Slack.
+You stay in control. The agent never trades without your approval. Signals arrive in Slack, you type `approve XXXXXXXX`, and the trade executes. You can also reject signals, start a pair-specific chat session, and have a full conversation with the agent about market conditions — all from Slack.
+
+**Market regime engine.** Before every full analysis the agent computes a four-dimensional market regime:
+
+- **Risk Sentiment** — VIX level + pair realized volatility from M15 bars
+- **Technical Trend** — daily SMA20/50/200 stack alignment + M15 bar momentum ratio
+- **Volatility** — ATR-14 vs 30-day ATR baseline (are stops standard or need widening?)
+- **Macro Bias** — live 10Y government bond yield spreads (fetched from ECB, BOE, and Japan MOF) combined with central bank rate cycle stances and forward guidance
+
+Claude Sonnet sees this regime summary alongside the news and price data, and is instructed to explain how its trade direction and stop loss width align with (or conflict with) the current regime.
+
+**Automatic central bank policy tracking.** Whenever the news scanner detects a central bank headline (Fed, ECB, BOE, or BOJ — any speech, press conference, or rate decision), the agent automatically fetches the latest official statement from the bank's website, uses Claude Haiku to extract the current stance and forward guidance, and writes the result to `data/rate_cycles.json`. The regime engine picks up the update immediately on the next analysis run. A Slack notification is sent, with `[STANCE CHANGED]` flagged when the stance differs from the previous reading.
 
 ---
 
@@ -42,85 +58,124 @@ The system is organised into four jobs. All four start automatically when you ru
 
 ### Job 1 — Opportunity Scanner (runs every 30 minutes)
 
-Job 1 is the core loop. It wakes up every 30 minutes during market hours, fetches the latest news from NewsAPI, AlphaVantage, and EODHD, and runs a fast triage model (Claude Haiku) over each headline to score it 1–10 for EUR/USD relevance.
+Job 1 is the core loop. Every 30 minutes during market hours it:
 
-If a headline scores 6 or above, Job 1 triggers a full deep analysis using Claude Sonnet. It feeds the model a rich context package — recent EURUSD prices, correlated assets (DXY, Gold, US10Y, S&P 500, VIX), today's news log, and the past week of daily summaries — and asks for a structured signal:
+1. **Refreshes the economic calendar** — fetches today's ForexFactory events (USD, EUR, GBP, JPY) with the latest actual vs forecast data. This happens once per cycle so Claude always has up-to-date beat/miss information during the trading day.
+
+2. **Scans news for each active pair** — for EURUSD, GBPUSD, and USDJPY independently:
+   - Fetches headlines from NewsAPI (pair-specific API query), AlphaVantage (broad macro + keyword filter), and EODHD (pair-specific ticker feed)
+   - Filters new articles through a per-pair deduplication cache
+   - Sends headlines to Claude Haiku for fast triage scoring (1–10) and tagging in the context of that specific pair
+   - Tags include `cb_decision`, `CB_speech`, `macro_data`, `geopolitical`, `risk_off`, `risk_on`, `other`. CB headlines also carry a `cb_bank` field (`Fed`, `ECB`, `BOE`, or `BOJ`)
+
+3. **Triggers CB policy update** — any headline tagged `cb_decision` or `CB_speech` launches a background fetch of that bank's latest official statement and a Haiku-powered extraction of the current stance and guidance. Updates `data/rate_cycles.json` automatically, with per-bank per-day deduplication to avoid redundant fetches.
+
+4. **Escalates high-score articles** — if any headline scores 6 or above and the pair is not in cooldown, Job 1 triggers a full deep analysis using Claude Sonnet with extended thinking enabled. It feeds the model a rich context package:
+   - Today's scored headlines
+   - Economic events with actuals vs forecasts
+   - Current market regime (risk sentiment, technical trend, volatility, macro bias with live yield spreads and rate cycle stances)
+   - Upcoming 48-hour economic calendar
+   - Live price: tick, M15 OHLC bars, daily SMA20/50/200, ATR-14, correlated asset prices
+   - Past 7 days of daily summaries
+
+Claude returns a structured signal:
 
 ```
-Signal     : Long
-Confidence : High
-Horizon    : Intraday
-Rationale  : ECB minutes showed a more dovish tone than expected...
-Key Levels : Support 1.0820 | Resistance 1.0910
-Invalidation: Close below 1.0800
-Risk Note  : NFP data tomorrow at 13:30 UTC — reduce size
+GBP/USD Long  [High] — 1-3 days
+Trigger [8]: UK CPI beats forecast at 3.2%, BOE rate cut bets fade
+
+Price: 1.2743  Open 1.2698  H 1.2748  L 1.2691  +0.31%
+Trend: Bullish — above SMA20/50, positive momentum on M15
+
+Rationale: UK CPI surprise (3.2% vs 2.9% forecast) reduces BOE cut
+probability. Combined with soft US retail sales, fundamental setup
+favours GBP/USD upside.
+
+Key Levels: Support 1.2700 | Resistance 1.2800
+Invalidation: Close below 1.2680 (SMA20)
+Risk Note: Fed speakers at 15:00 UTC could reverse USD weakness
+
+Order Details (live)
+Entry 1.2743  SL 1.2680 (-63p)  TP 1.2820 (+77p)
+Lot 0.12  Risk $100  R:R 1:1.2
+
+approve A3F9BC12    |    reject A3F9BC12
 ```
 
-This signal is posted to Slack and printed to the console. If the action is Long or Short, a pending signal is saved to the store and the Slack message includes the approval command.
+After triggering, Job 1 sets a per-pair cooldown (default 45 minutes). EURUSD cooldown does not block GBPUSD escalation — each pair is fully independent.
 
-After a trigger, Job 1 enters a 45-minute cooldown to avoid sending repeated alerts on the same news event.
-
-Job 1 also runs an end-of-day collector at 22:00 UTC every day in a background thread. This fetches closing prices and news, writes daily summary files to the `data/` folder, and cleans up old signals from the store.
+Job 1 also runs an end-of-day collector at 22:00 UTC in a background thread: fetches closing prices and events, generates daily summary files, and cleans up old signals.
 
 ### Job 2 — Position Monitor (runs every 30 minutes)
 
-Job 2 runs as a background thread alongside Job 1. It connects to your MT5 terminal and reads all open EUR/USD positions. For each open position it calls Claude Sonnet with the position details (entry price, current P&L, SL/TP levels), account health (equity, margin level, drawdown), and the current market snapshot.
+Job 2 runs as a background thread alongside Job 1. It reads all open positions across all active pairs and for each position calls Claude Sonnet with:
+- Position details: direction, volume, entry price, current P&L in dollars and pips, SL/TP levels
+- Account health: equity, balance, free margin, margin level, drawdown
+- Current market snapshot: live bid/ask, spread
+- Recent market context for the position's pair
 
 Claude returns one of three recommendations:
 
-- **Hold** — the position is on track, no action needed.
-- **Trim** — risk/reward has deteriorated but the direction is still valid; partially close the position.
-- **Exit** — the original trade thesis is broken; close the position in full.
+- **Hold** — position is on track; informational alert only, no approval needed.
+- **Trim** — risk/reward has deteriorated but direction still valid; partially close.
+- **Exit** — original thesis is broken; close the full position.
 
-Hold signals are informational only. Trim and Exit recommendations are saved as pending signals and posted to Slack with an approval command. You decide whether to act.
+Trim and Exit signals are saved as pending and posted to Slack for your approval.
 
 ### Job 3 — Trade Executor
 
-Job 3 is the execution engine. It is not a loop — it runs when you approve a signal (either from Slack or the command line). It reads the approved signal from the store and routes it to the correct MT5 action:
+Job 3 runs when you approve a signal. It routes each signal type to the correct MT5 action:
 
-| Signal source | Signal type | MT5 action |
-|---------------|-------------|------------|
+| Signal source | Action | MT5 operation |
+|---|---|---|
 | Job 1 | Long | Open BUY market order |
 | Job 1 | Short | Open SELL market order |
 | Job 2 / Job 4 | Exit | Close full position |
 | Job 2 / Job 4 | Trim | Close partial position (default 50%) |
 | Job 4 | SetSL / SetTP / SetSLTP | Modify stop loss / take profit |
 
-For new positions (Long/Short), Job 3 calculates lot size automatically: it risks exactly 1% of your current account equity on each trade, using the stop loss distance in pips to determine the correct lot size. The result is clamped between 0.01 and 1.0 lots.
+For new positions (Long/Short), Job 3 calculates lot size automatically: it risks exactly `JOB3_RISK_PCT` (default 1%) of your current account equity, using the SL distance in pips. Pip values are pair-aware — USD-quote pairs (EUR/USD, GBP/USD) use $10/pip per standard lot; JPY pairs (USD/JPY) use the approximate JPY pip value configured in `config.py`.
 
 ### Job 4 — Chat Assistant
 
-Job 4 is a conversational interface to the entire system. You can DM the Slack bot or @mention it in a channel and ask anything in plain English:
+Job 4 is a conversational interface that can be seeded with a pair's market analysis. Start a session with `chat`, `chat GBPUSD`, or `chat USDJPY`. Claude opens with the full market analysis pre-loaded and then answers questions with live tool access:
 
-- "What's the EUR/USD situation right now?"
-- "Show me my open positions"
-- "The news is looking bearish — can you propose a short with SL at 1.0850?"
+| Tool | What Claude fetches |
+|---|---|
+| `get_positions` | All open MT5 positions across all active pairs with live P&L and pips |
+| `get_account` | Equity, balance, free margin, margin level, drawdown |
+| `get_news` | Today's scored headlines for the session's pair |
+| `get_market_context` | Full context: prices, technicals, correlated assets, events, regime |
+| `get_pending_signals` | Current pending signal queue |
+| `modify_order` | Adjust SL, TP, or lot size on a pending signal |
+| `propose_order` | Create a new pending signal for your approval |
 
-Job 4 uses Claude Sonnet with tool calling. It can fetch live prices, read open positions, pull recent news, check pending signals, and — when you ask it to take a trading action — call an internal `propose_order` tool to create a pending signal that goes through the normal approval flow.
-
-Conversations are threaded. Each Slack thread keeps its own 2-hour history so the agent remembers context within a conversation.
+Chat sessions are threaded and pair-aware. Each thread keeps 2 hours of history. The pair context (system prompt, news fetch, market context) matches the pair the session was started for. Say `end chat` to close the session.
 
 ---
 
 ## Requirements
 
-**Operating system:** Windows only. The MetaTrader 5 Python package (`MetaTrader5`) only runs on Windows.
+**Operating system:** Windows only. The MetaTrader 5 Python package only runs on Windows.
 
-**MetaTrader 5 terminal:** The MT5 desktop application must be running and logged into your broker account before you start the agent. The agent connects to the already-running terminal — it does not launch MT5 itself.
+**MetaTrader 5 terminal:** The MT5 desktop application must be running and logged into your broker account before you start the agent. All active pair symbols must be visible in the Market Watch.
 
 **Python environment:** Anaconda or Miniconda. The instructions below use a Conda environment named `mt5_env`.
 
 **External accounts required:**
 
-| Service | What it is used for | Free tier available? |
-|---------|---------------------|----------------------|
-| Anthropic | Claude Haiku (triage) + Claude Sonnet (analysis/chat) | No — pay per token |
-| NewsAPI | Financial news headlines | Yes (developer plan, 100 req/day) |
-| AlphaVantage | Financial news + sentiment | Yes (25 req/day free) |
-| EODHD | Financial news headlines | Yes (limited free tier) |
+| Service | Used for | Free tier? |
+|---|---|---|
+| Anthropic | Claude Haiku (triage + CB policy extraction) + Claude Sonnet (analysis, positions, chat) | No — pay per token |
+| NewsAPI | Financial news headlines per pair | Yes (100 req/day) |
+| AlphaVantage | Financial news + sentiment | Yes (25 req/day) |
+| EODHD | Pair-specific news feed | Yes (limited) |
 | Slack | Notifications + two-way command interface | Yes |
-
-**Slack app:** You need to create a Slack app with Socket Mode enabled. Step-by-step instructions are below.
+| ForexFactory | Economic calendar with actuals/forecasts | Free (public JSON) |
+| yfinance | Daily prices + US10Y (^TNX) | Free |
+| ECB Data Portal | DE10Y daily yield (EUR/USD macro bias) | Free (no key needed) |
+| Bank of England API | UK10Y daily yield (GBP/USD macro bias) | Free (no key needed) |
+| Japan Ministry of Finance | JP10Y daily yield (USD/JPY macro bias) | Free (no key needed) |
 
 ---
 
@@ -128,42 +183,37 @@ Conversations are threaded. Each Slack thread keeps its own 2-hour history so th
 
 ### 1. Download the code
 
-If you have Git installed, open Anaconda Prompt and run:
-
 ```bash
 git clone <repository-url> C:\Users\<yourname>\Documents\eurusd_agent
 ```
 
-If you do not have Git, download the ZIP from the repository page and extract it to `C:\Users\<yourname>\Documents\eurusd_agent`.
+Or download the ZIP and extract to `C:\Users\<yourname>\Documents\eurusd_agent`.
 
 ### 2. Create the Conda environment
 
-Open Anaconda Prompt (not regular Command Prompt — you need the Conda tools) and run these commands one at a time:
+Open Anaconda Prompt and run:
 
 ```bash
 conda create -n mt5_env python=3.11 -y
 conda activate mt5_env
 pip install MetaTrader5
 pip install slack-bolt
+pip install pdfminer.six
 pip install -r C:\Users\<yourname>\Documents\eurusd_agent\requirements.txt
 ```
 
-`MetaTrader5` and `slack-bolt` are installed separately. `MetaTrader5` is Windows-only and not in the shared requirements file. `slack-bolt` is only needed if you want the two-way Slack command interface (you still get one-way Slack webhook alerts without it).
+`MetaTrader5` is Windows-only and installed separately. `slack-bolt` is only needed for the two-way Slack command interface. `pdfminer.six` is used to extract text from Bank of Japan PDF policy statements.
 
-Verify the installation worked:
+Verify the installation:
 
 ```bash
 cd C:\Users\<yourname>\Documents\eurusd_agent
 python verify_imports.py
 ```
 
-This script checks that all required packages import correctly and will tell you if anything is missing.
-
 ### 3. Create the .env file
 
-In the `eurusd_agent` folder, create a file named exactly `.env` (the filename starts with a dot and has no extension). In Notepad, save it as type "All Files" and name it `.env`.
-
-Paste the template below and fill in your own values:
+Create a file named `.env` in the `eurusd_agent` folder (filename starts with a dot, no extension). In Notepad, save it as type "All Files" and name it `.env`.
 
 ```
 # Anthropic — https://console.anthropic.com/
@@ -173,113 +223,77 @@ ANTHROPIC_API_KEY=sk-ant-...
 NEWS_API_KEY=...
 
 # AlphaVantage — https://www.alphavantage.co/support/#api-key
-ALPHAVANTAGE_API_KEY=...
+ALPHA_VANTAGE_API_KEY=...
 
 # EODHD — https://eodhd.com/register
 EODHD_API_KEY=...
 
 # Slack — incoming webhook (one-way signal alerts posted to a channel)
-# Get this from your Slack app's "Incoming Webhooks" page
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 
 # Slack — Socket Mode bot (two-way commands: approve, reject, chat, etc.)
-# SLACK_BOT_TOKEN: "Bot User OAuth Token" on the OAuth & Permissions page (starts with xoxb-)
-# SLACK_APP_TOKEN: "App-Level Token" on the Basic Information page (starts with xapp-)
+# SLACK_BOT_TOKEN: Bot User OAuth Token (starts with xoxb-)
+# SLACK_APP_TOKEN: App-Level Token (starts with xapp-)
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 
-# Email alerts (optional)
-# To disable email, leave SMTP_USER and SMTP_PASSWORD blank or remove these lines.
-# For Gmail, use an App Password, not your regular password:
-# https://support.google.com/accounts/answer/185833
+# Email alerts (optional — leave blank to disable)
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=your@gmail.com
 SMTP_PASSWORD=your-app-password
 ```
 
-**Where to get each key:**
-
-- **ANTHROPIC_API_KEY** — Sign up at https://console.anthropic.com, go to API Keys, and create a new key. This key costs money every time a model is called; keep it private.
-- **NEWS_API_KEY** — Register at https://newsapi.org/register. The free developer plan allows 100 requests per day.
-- **ALPHAVANTAGE_API_KEY** — Get a free key at https://www.alphavantage.co/support/#api-key. The free tier allows 25 requests per day.
-- **EODHD_API_KEY** — Register at https://eodhd.com. A limited free tier is available.
-- **SLACK_WEBHOOK_URL** — Created during Slack app setup (Step 4 below).
-- **SLACK_BOT_TOKEN** — Created during Slack app setup (Step 4 below).
-- **SLACK_APP_TOKEN** — Created during Slack app setup (Step 4 below).
-
 ### 4. Set up a Slack app
-
-This is the most involved setup step. The Slack integration has two parts: a one-way incoming webhook (for posting signal alerts) and a two-way Socket Mode bot (for receiving your commands). Both are configured inside the same Slack app.
 
 #### Step 4a — Create the app
 
-1. Go to https://api.slack.com/apps and click **Create New App**.
-2. Choose **From scratch**.
-3. Give the app a name such as `EURUSD Agent`.
-4. Select your workspace and click **Create App**.
+1. Go to https://api.slack.com/apps and click **Create New App → From scratch**.
+2. Name it (e.g. `Forex Agent`) and select your workspace.
 
 #### Step 4b — Add bot token scopes
 
-1. In the left sidebar, click **OAuth & Permissions**.
-2. Scroll down to **Bot Token Scopes** and click **Add an OAuth Scope**.
-3. Add all four of the following scopes:
-   - `chat:write` — allows the bot to post messages
-   - `im:history` — allows the bot to read direct messages sent to it
-   - `channels:history` — allows the bot to read messages in channels it joins
-   - `app_mentions:read` — allows the bot to receive @mention events
+Under **OAuth & Permissions → Bot Token Scopes**, add:
+- `chat:write`
+- `im:history`
+- `channels:history`
+- `app_mentions:read`
 
-#### Step 4c — Enable incoming webhooks (for signal alerts)
+#### Step 4c — Enable incoming webhooks
 
-1. In the left sidebar, click **Incoming Webhooks**.
-2. Toggle **Activate Incoming Webhooks** to On.
-3. Click **Add New Webhook to Workspace**.
-4. Choose the channel where you want signal alerts to appear (for example, `#eurusd-alerts`). You can create this channel in Slack first if it does not exist.
-5. Click **Allow**.
-6. Copy the webhook URL that appears (it starts with `https://hooks.slack.com/services/`). Paste it into `.env` as `SLACK_WEBHOOK_URL`.
+1. **Incoming Webhooks → Activate Incoming Webhooks → On**.
+2. Click **Add New Webhook to Workspace**, select your alerts channel.
+3. Copy the webhook URL into `.env` as `SLACK_WEBHOOK_URL`.
 
-#### Step 4d — Enable Socket Mode (for two-way commands)
+#### Step 4d — Enable Socket Mode
 
-1. In the left sidebar, click **Socket Mode**.
-2. Toggle **Enable Socket Mode** to On.
-3. When prompted to create an App-Level Token, give it a name such as `socket-token` and tick the `connections:write` scope.
-4. Click **Generate**.
-5. Copy the token shown (it starts with `xapp-`). Paste it into `.env` as `SLACK_APP_TOKEN`.
+1. **Socket Mode → Enable Socket Mode → On**.
+2. Create an App-Level Token with the `connections:write` scope.
+3. Copy the `xapp-` token into `.env` as `SLACK_APP_TOKEN`.
 
 #### Step 4e — Subscribe to bot events
 
-1. In the left sidebar, click **Event Subscriptions**.
-2. Toggle **Enable Events** to On.
-3. Under **Subscribe to bot events**, click **Add Bot User Event** and add all three:
-   - `message.im` — receives direct messages
-   - `message.channels` — receives messages in channels the bot has joined
-   - `app_mention` — receives @mentions
-4. Click **Save Changes** at the bottom of the page.
+Under **Event Subscriptions → Subscribe to bot events**, add:
+- `message.im`
+- `message.channels`
+- `app_mention`
+
+Save changes.
 
 #### Step 4f — Install the app and get the bot token
 
-1. In the left sidebar, click **OAuth & Permissions**.
-2. Click **Install to Workspace** (or **Reinstall to Workspace** if the button says reinstall).
-3. Review the permissions and click **Allow**.
-4. Copy the **Bot User OAuth Token** (it starts with `xoxb-`). Paste it into `.env` as `SLACK_BOT_TOKEN`.
+1. **OAuth & Permissions → Install to Workspace**.
+2. Copy the **Bot User OAuth Token** (`xoxb-`) into `.env` as `SLACK_BOT_TOKEN`.
 
 #### Step 4g — Invite the bot to your channel
 
-In Slack, open the channel you chose for alerts and type:
-
-```
-/invite @EURUSD Agent
-```
-
-The bot must be a member of the channel to post messages to it. This step is easy to forget.
+In Slack, open your alerts channel and type `/invite @Forex Agent`.
 
 ---
 
 ## Running the agent
 
-Before starting, make sure MetaTrader 5 is open and logged into your broker account.
-
-Open Anaconda Prompt and run:
+Make sure MetaTrader 5 is open and all active pair symbols are visible in Market Watch.
 
 ```bash
 conda activate mt5_env
@@ -287,11 +301,12 @@ cd C:\Users\<yourname>\Documents\eurusd_agent
 python -m agents.job1_opportunity
 ```
 
-You will see startup output similar to this:
+Startup output:
 
 ```
 ============================================================
-EUR/USD Opportunity Scanner — Job 1
+Forex Multi-Pair Agent — Job 1
+  Active pairs  : ['EURUSD', 'GBPUSD', 'USDJPY']
   Triage model  : claude-haiku-4-5-20251001
   Analysis model: claude-sonnet-4-6
   Scan interval : 30 min
@@ -305,207 +320,158 @@ Job 2 position monitor starting in background
 Slack bot starting in background
 ```
 
-All four jobs start from this single command. Job 1's scanner loop runs in the foreground. Jobs 2, the daily collector, and the Slack bot run as background threads. The process blocks until you press `Ctrl+C`.
+All four jobs start from this single command. Job 1 runs in the foreground; everything else runs as background threads. Press `Ctrl+C` to stop.
 
-**To manage signals from the command line instead of Slack:**
+**Managing signals from the command line:**
 
 ```bash
 # List pending, approved, and recently executed signals
 python -m agents.job3_executor --list
 
-# Approve a signal and execute it immediately on MT5
+# Approve and execute a signal
 python -m agents.job3_executor --approve A1B2C3D4
 
-# Approve a Trim signal and close only 25% of the position (default is 50%)
+# Approve a Trim signal and close 25% (default is 50%)
 python -m agents.job3_executor --approve A1B2C3D4 --pct 25
 
-# Reject a signal (no trade is placed)
+# Reject a signal
 python -m agents.job3_executor --reject A1B2C3D4
 ```
-
-Signal IDs are 8-character alphanumeric codes such as `A1B2C3D4`. They appear in Slack alert messages and in the `--list` output. IDs are case-insensitive.
 
 ---
 
 ## Slack commands
 
-Send any of these as a direct message to the bot, or @mention the bot in your alerts channel (for example `@EURUSD Agent scan`).
+Send commands as a DM to the bot, or @mention it in your alerts channel.
+
+### Scanning and analysis
 
 | Command | What it does |
-|---------|--------------|
-| `scan` or `update` | Force an immediate news scan, bypassing the 30-minute timer and market hours check |
-| `positions` | Run a Job 2 position check right now |
-| `status` | Show system health: cooldown timer remaining, MT5 connection state, number of pending signals |
-| `collect` | Trigger the end-of-day data collection immediately |
-| `pending` | List all signals currently waiting for your approval, with their IDs |
-| `approve <ID>` | Approve a pending signal and execute it on MT5 |
-| `approve <ID> <pct>` | Approve a Trim signal and close `<pct>` percent of the position (e.g. `approve A1B2C3D4 25`) |
-| `reject <ID>` | Reject a pending signal — no trade is placed |
-| `help` | Show the command list |
-| `hi` / `hello` / `who are you` | The bot introduces itself and explains what it does |
-| _Any other message_ | Starts or continues a free-form conversation with the Job 4 chat assistant |
+|---|---|
+| `scan` | Refresh economic calendar, scan news for **all** active pairs, triage with Haiku, escalate high-score articles to Sonnet |
+| `scan GBPUSD` | Same but for one pair only |
+| `analyze` | Full analysis for the primary pair (EURUSD) — builds context, runs Sonnet, returns signal with order details |
+| `analyze USDJPY` | Full analysis for a specific pair |
+| `positions` | Run Job 2 position check right now across all pairs |
+| `collect` | Trigger end-of-day data collection immediately |
 
-**Examples:**
+### Signal management
 
-```
-scan
-positions
-status
-pending
-approve A1B2C3D4
-approve A1B2C3D4 25
-reject A1B2C3D4
-What does the EUR/USD chart look like right now?
-Is now a good time to add to my long?
-Propose a short with SL at 1.0920 and TP at 1.0750
-```
+| Command | What it does |
+|---|---|
+| `pending` | List all signals waiting for approval |
+| `approve <ID>` | Approve and execute a signal on MT5 |
+| `approve <ID> <pct>` | Approve a Trim signal and close `<pct>`% of the position (e.g. `approve A1B2C3D4 25`) |
+| `reject <ID>` | Reject a signal — no trade placed |
 
-The bot also understands natural language variants of commands, not just exact keywords. "Fetch the latest news", "check my portfolio", and "what's the system status?" are all understood correctly through an NLP classifier. If the NLP classifier cannot determine the intent, the message is routed to the Job 4 chat assistant.
+### Chat sessions
+
+| Command | What it does |
+|---|---|
+| `chat` | Start an analysis-seeded chat session for the primary pair |
+| `chat GBPUSD` | Start a chat session seeded with GBP/USD analysis |
+| `chat USDJPY` | Start a chat session seeded with USD/JPY analysis |
+| `end chat` | Close the current chat session |
+
+Inside a chat session Claude has live tool access: positions, account info, news, market context, and the ability to propose orders.
+
+### System
+
+| Command | What it does |
+|---|---|
+| `status` | Per-pair cooldown timers, MT5 connection state, pending signal count |
+| `help` | Full command reference |
+| `hi` / `hello` / `introduce` | Bot explains itself |
+| _Any other message_ | Natural language → Haiku classifies intent → routes to handler or falls back to chat |
+
+**Natural language works too.** "Scan the news for pound dollar", "check my positions", "any signals waiting?" are all understood without exact syntax.
 
 ---
 
 ## Approval workflow — a full example
 
-Here is what a complete signal lifecycle looks like, from detection to execution.
+### 09:15 UTC — Job 1 detects a high-impact event
 
----
+The scanner picks up: "UK CPI beats forecast at 3.2%, BOE rate cut bets fade". Claude Haiku scores it 8/10 for GBP/USD and tags it `macro_data`. Full analysis triggers.
 
-**09:15 UTC — Job 1 detects a high-impact news event**
+Claude Sonnet builds the GBP/USD context — today's news, economic events including the UK CPI actual vs forecast, current market regime (VIX, SMA stack, ATR, macro bias showing GBP yield advantage narrowing), live M15 bars, 30-day price trend, FTSE and EURGBP correlations — and returns a Long signal.
 
-The scanner picks up a headline: "ECB officials signal no further rate hikes in 2026". The triage model (Claude Haiku) scores it 8/10. This is above the threshold of 6, so full analysis is triggered.
-
-Claude Sonnet analyses the headline in context with current prices, DXY movements, and recent market summaries. It produces a Long signal and the agent posts it to Slack.
-
----
-
-**09:15 UTC — Slack alert arrives in #eurusd-alerts**
+### 09:15 UTC — Slack alert
 
 ```
-EUR/USD Long  [High] — Intraday
-2026-03-16 09:15 UTC
-Trigger [8]: ECB officials signal no further rate hikes in 2026 (central_bank)
+📈 GBP/USD Long 🟡 Medium — 1-3 days
+2026-03-20 09:15 UTC
+Trigger [8]: UK CPI beats forecast at 3.2%, BOE rate cut bets fade (macro_data)
 
-Rationale: ECB pivot narrative supports EUR bulls. DXY weakening on USD
-yield compression. Structure aligns with bullish breakout above
-the 1.0870 resistance turned support.
+Price: 1.2743  Open 1.2698  H 1.2748  L 1.2691  +0.31%
+Trend: Bullish — above SMA20/50, positive momentum on M15
+Today: UK CPI surprise beat pushed GBP/USD 60 pips higher.
+This week: GBP/USD up ~100 pips; BOE hold last Wednesday set the bullish tone.
 
-Key Levels: Support 1.0870 | Resistance 1.0960
-Invalidation: Hourly close below 1.0845
-Risk Note: Fed speaker at 14:00 UTC — may cause short-term volatility
+Rationale: UK CPI (3.2% vs 2.9%) reduces BOE cut probability. Soft US
+retail sales adds dollar weakness tailwind. Structure breaking above 1.2740.
+Key Levels: Support 1.2700 | Resistance 1.2800
+Invalidation: Close below 1.2680 (SMA20)
+Risk Note: Fed speakers at 15:00 UTC could reverse USD weakness
 
-To execute: python -m agents.job3_executor --approve 3F8A1C09
-To reject:  python -m agents.job3_executor --reject 3F8A1C09
+Order Details (live)
+Entry 1.2743  SL 1.2680 (-63p)  TP 1.2820 (+77p)
+Lot 0.12  Risk $100  R:R 1:1.2
+
+✅ approve A3F9BC12    ✏️ chat    ❌ reject A3F9BC12
 ```
 
-(If the Slack bot is running, you can also just type `approve 3F8A1C09` directly in Slack.)
-
----
-
-**09:17 UTC — You review and approve**
-
-You read the signal, agree with the reasoning, and type in Slack:
+### 09:17 UTC — You approve
 
 ```
-approve 3F8A1C09
+approve A3F9BC12
 ```
 
----
-
-**09:17 UTC — Job 3 executes the trade**
-
-The bot responds immediately in Slack:
+### 09:17 UTC — Job 3 executes
 
 ```
-Signal `3F8A1C09` executed!
-Ticket:      12345678
-Fill price:  1.08923
-Volume:      0.08 lots
+✅ Signal A3F9BC12 executed!
+Ticket:     12345678
+Fill price: 1.27431
+Volume:     0.12 lots
 ```
 
-Behind the scenes, Job 3 did the following:
-1. Retrieved the signal from the store and confirmed it was still pending (not expired).
-2. Marked the signal as approved.
-3. Fetched the current ask price from MT5 (1.08923).
-4. Derived SL = 1.0870 and TP = 1.0960 from the signal's key levels.
-5. Calculated lot size: with $10,000 equity, risking 1% ($100), and a 53-pip stop loss ($10/pip per standard lot), the formula gives $100 / (53 × $10) = 0.189 lots, clamped to 0.08 lots after rounding to two decimal places and applying broker limits.
-6. Sent a BUY market order to MT5 tagged with magic number `20260314` so it can be identified as coming from this agent.
+Behind the scenes Job 3: fetched the live ask price, calculated SL/TP from the signal's key levels, computed lot size (1% of equity ÷ (63 pips × $10/pip) = 0.12 lots), and sent a BUY market order to MT5.
 
----
+### 11:00 UTC — Job 2 checks the position
 
-**11:00 UTC — Job 2 checks the open position**
+GBP/USD is at 1.2790, trade is up $56. Claude recommends Hold — position on track, no approval needed. Informational message posted to Slack.
 
-Thirty minutes after the trade opened, Job 2 wakes up, reads the position, and calls Claude Sonnet. EUR/USD is now at 1.0940 and the trade is up $136. Claude recommends Hold:
+### What if the recommendation were Exit?
 
 ```
-Action    : Hold
-Confidence: High
-Rationale : Position tracking toward TP at 1.0960. Structure intact above
-            1.0870 support. No reason to exit early.
+✂️ Position Monitor — #12345678 BUY 0.12L @ 1.27431 | P&L: -$38
+GBP/USD Exit [Medium]
+Rationale: Price broke below 1.2680 invalidation on hourly close.
+
+✅ approve 9D2E4B11    ❌ reject 9D2E4B11
 ```
 
-Because the recommendation is Hold, no pending signal is created and no approval is needed. The update is posted to Slack as an informational message only.
+Type `approve 9D2E4B11` to close the full position, or `approve 9D2E4B11 50` to close only half.
 
----
-
-**What if the recommendation were Exit instead?**
-
-If conditions deteriorated and Claude recommended Exit, the Slack message would look like this:
+### Using chat to propose a trade
 
 ```
-Position Monitor — #12345678 BUY 0.08L @ 1.08923 | P&L: -$45
-Action: Exit  [Medium]
-
-Rationale: Price broke below the 1.0845 invalidation level on the last
-hourly close. Original thesis is no longer valid.
-
-To execute: approve 9D2E4B11
-To reject:  reject 9D2E4B11
+chat GBPUSD
 ```
 
-You type `approve 9D2E4B11` and Job 3 closes the full position at the current bid price.
-
----
-
-**What if you only want to close part of the position?**
-
-For a Trim recommendation, you can control how much is closed by including a percentage:
+The bot opens with the full GBP/USD analysis pre-loaded. You can then ask:
 
 ```
-approve 9D2E4B11 25
+The setup looks clean. Can you propose a long with SL at 1.2650?
 ```
 
-This closes 25% of the 0.08-lot position (0.02 lots), leaving 0.06 lots open. If you omit the percentage, the default is 50%.
-
----
-
-**Signals expire automatically**
-
-If you do not approve or reject a signal within 60 minutes of its creation, it expires automatically. Expired signals cannot be executed. The end-of-day cleanup (runs daily at 22:00 UTC) removes signals older than 7 days from the store. You can check the current status of all signals with:
+Claude fetches the live price, calculates the risk, and proposes:
 
 ```
-pending
+📝 Order proposed — Signal ID: B7C3D912
+✅ approve B7C3D912    ❌ reject B7C3D912
 ```
-
----
-
-**Using the chat assistant to propose a trade**
-
-Instead of waiting for Job 1 to generate a signal, you can ask Job 4 to propose one directly. Start a conversation in Slack by DMing the bot or @mentioning it:
-
-```
-@EURUSD Agent The dollar is looking weak after the CPI miss. Can you check
-the current EURUSD chart and propose a long if the setup looks clean?
-```
-
-Job 4 will call its tools to fetch live data, analyse the situation, and if appropriate call `propose_order` internally. It will reply with its reasoning and post a signal ID:
-
-```
-Order proposed — Signal ID: `B7C3D912`
-To execute: approve B7C3D912
-To cancel:  reject B7C3D912
-```
-
-You approve or reject it the same way as any other signal.
 
 ---
 
@@ -513,56 +479,126 @@ You approve or reject it the same way as any other signal.
 
 ```
 eurusd_agent/
-├── config.py                  # All tunable parameters — edit this to change behaviour
-├── requirements.txt           # Python package dependencies
-├── verify_imports.py          # Quick import check after install
+├── config.py                  # All tunable parameters — pairs, models, risk, timing, rate cycles
+├── requirements.txt
+├── verify_imports.py
 │
 ├── agents/
 │   ├── job1_opportunity.py    # Entry point — starts all four jobs
-│   ├── job2_position.py       # Position monitor loop
+│   ├── job2_position.py       # Position monitor (all active pairs)
 │   ├── job3_executor.py       # Trade execution engine + CLI
-│   ├── job4_chat.py           # Conversational assistant (Claude Sonnet + tools)
-│   └── slack_bot.py           # Slack Socket Mode bot + command dispatcher
+│   ├── job4_chat.py           # Conversational assistant (pair-aware, tool calling)
+│   └── slack_bot.py           # Slack bot — command dispatcher + NLP fallback
 │
 ├── triage/
-│   ├── scanner.py             # 30-minute news scan loop
-│   ├── triage_prompt.py       # Claude Haiku prompt for scoring headlines
+│   ├── scanner.py             # 30-min scan loop — refreshes events, scans all pairs,
+│   │                          # triggers CB policy update on CB-tagged headlines
+│   ├── triage_prompt.py       # Claude Haiku prompt — scores, tags, identifies cb_bank
 │   ├── intraday_logger.py     # Logs today's scored headlines to disk
-│   └── cooldown.py            # 45-minute cooldown lock management
+│   └── cooldown.py            # Per-pair cooldown: data/.cooldown_EURUSD, etc.
 │
 ├── analysis/
-│   ├── context_builder.py     # Assembles the context package for Sonnet
-│   ├── full_analysis_prompt.py # Sonnet prompt for full trade analysis
-│   └── signal_formatter.py    # Validates and formats signal output
+│   ├── context_builder.py     # Assembles context window (news + events + regime + prices)
+│   ├── full_analysis_prompt.py # Claude Sonnet prompt with extended thinking
+│   └── signal_formatter.py    # Validates and normalises signal output
 │
 ├── pipeline/
-│   ├── signal_store.py        # Pending signal queue (data/pending_signals.json)
-│   ├── daily_collector.py     # End-of-day price + summary collection
-│   ├── news_fetcher.py        # NewsAPI, AlphaVantage, EODHD fetchers
-│   ├── price_fetcher.py       # yfinance price data (EURUSD, DXY, Gold, etc.)
-│   ├── event_fetcher.py       # Economic calendar events
-│   └── dedup_cache.py         # SHA-256 deduplication to avoid processing the same headline twice
+│   ├── signal_store.py        # Pending signal queue
+│   ├── daily_collector.py     # End-of-day: prices, events, summaries (all pairs)
+│   ├── news_fetcher.py        # NewsAPI / AlphaVantage / EODHD (pair-specific queries)
+│   ├── price_fetcher.py       # yfinance closing prices
+│   ├── price_agent.py         # Live price summary: tick, M15, daily, technicals,
+│   │                          # yield spreads (ECB / BOE / MOF Japan), macro bias
+│   ├── regime_agent.py        # Market regime engine: risk sentiment, technical trend,
+│   │                          # volatility, macro bias with conflict detection
+│   ├── cb_policy_updater.py   # Auto-fetches CB statements (Fed/ECB/BOE/BOJ),
+│   │                          # extracts stance with Haiku, writes data/rate_cycles.json
+│   ├── event_fetcher.py       # ForexFactory calendar (USD/EUR/GBP/JPY) + FRED
+│   └── dedup_cache.py         # Per-pair dedup: data/.dedup_cache_EURUSD, etc.
 │
 ├── mt5/
-│   ├── connector.py           # MT5 connect / disconnect / connection check
-│   ├── position_reader.py     # Read open positions, account info, live ticks
+│   ├── connector.py           # MT5 connect / disconnect / health check
+│   ├── position_reader.py     # Open positions, account info, live ticks, OHLC bars
 │   ├── order_manager.py       # Open, close, and modify positions
-│   └── risk_manager.py        # Lot sizing (1% risk) and SL/TP calculation
+│   └── risk_manager.py        # Pair-aware lot sizing and SL/TP calculation
 │
 ├── notifications/
-│   └── notifier.py            # Dispatches alerts to Slack webhook, email, and console
+│   └── notifier.py            # Dispatches signals and plain-text alerts to Slack,
+│                              # email, and console
 │
 ├── utils/
 │   ├── logger.py              # Rotating file + console logging
-│   └── date_utils.py          # Market hours checks, UTC/EST timezone helpers
+│   ├── retry.py               # Exponential back-off for API calls
+│   └── date_utils.py          # Market hours, UTC/EST helpers
 │
-└── data/                      # Created automatically on first run (not committed to git)
-    ├── pending_signals.json   # Live signal queue — human-readable, safe to inspect
-    ├── .cooldown_lock         # Written when cooldown is active, deleted when it expires
-    ├── prices/                # Daily OHLCV price files (one JSON per day)
-    ├── news/                  # Daily news logs (one JSONL per day)
-    └── summaries/             # Daily market summary markdown files
+└── data/                      # Created automatically (not committed to git)
+    ├── pending_signals.json   # Live signal queue
+    ├── rate_cycles.json       # Auto-updated CB policy overrides (stance, guidance, expected)
+    ├── .cooldown_EURUSD       # Per-pair cooldown timestamps
+    ├── .cooldown_GBPUSD
+    ├── .cooldown_USDJPY
+    ├── .dedup_cache_EURUSD    # Per-pair article dedup caches
+    ├── .dedup_cache_GBPUSD
+    ├── .dedup_cache_USDJPY
+    └── YYYY-MM-DD/            # One folder per trading day
+        ├── intraday.jsonl     # Today's scored headlines (all pairs)
+        ├── events.json        # Today's economic events with actuals (refreshed each scan)
+        ├── prices.json        # End-of-day closing prices
+        ├── news.jsonl         # Merged daily news archive
+        └── summary.md         # LLM-generated end-of-day summary (all active pairs)
 ```
+
+---
+
+## Configuration reference
+
+All tunable parameters are in `config.py`. Edit it and restart the agent for changes to take effect.
+
+### Active pairs
+
+```python
+ACTIVE_PAIRS: list[str] = ["EURUSD", "GBPUSD", "USDJPY"]
+```
+
+To add AUD/USD: add `"AUDUSD"` to this list. Its full configuration (pip value, correlated assets, news queries) is already defined in the `PAIRS` dict and `_PAIR_NEWS` dict in `news_fetcher.py`.
+
+To remove a pair: remove it from `ACTIVE_PAIRS`. Everything else adapts automatically.
+
+### Key parameters
+
+| Parameter | Default | What it controls |
+|---|---|---|
+| `SCAN_INTERVAL_MINUTES` | 30 | How often Job 1 scans news |
+| `TRIAGE_SCORE_THRESHOLD` | 6 | Minimum score (1–10) to trigger full analysis |
+| `COOLDOWN_MINUTES` | 45 | Per-pair silence period after a trigger fires |
+| `JOB2_CHECK_INTERVAL_MINUTES` | 30 | How often Job 2 checks open positions |
+| `JOB3_RISK_PCT` | 1.0 | Percentage of equity risked per trade |
+| `JOB3_SIGNAL_EXPIRY_MINUTES` | 60 | How long a signal stays valid before auto-expiring |
+| `MARKET_HOURS_START` / `END` | 7 / 23 | Active scanning window (UTC hour) |
+| `DAILY_COLLECTION_TIME_UTC` | `"22:00"` | When end-of-day collection runs |
+| `TRIAGE_MODEL` | `claude-haiku-4-5-20251001` | Fast model for headline scoring and CB extraction |
+| `ANALYSIS_MODEL` | `claude-sonnet-4-6` | Full analysis, position monitor, chat |
+| `USE_REGIME_ANALYSIS` | `True` | Inject regime summary into the LLM context window |
+
+### Central bank rate cycles
+
+`RATE_CYCLES` in `config.py` sets the baseline policy stance for each central bank. Update it manually after major meetings. The agent also auto-updates `data/rate_cycles.json` from live official statements — that file takes precedence over the config baseline.
+
+```python
+RATE_CYCLES: dict[str, dict] = {
+    "Fed": {
+        "stance":   "Pausing",          # "Hiking" | "Pausing" | "Cutting"
+        "guidance": "No rush to cut - watching inflation; tariff uncertainty clouds outlook",
+        "expected": "1-2 cuts in 2025 (CME FedWatch ~55%)",
+        "updated":  "2026-03-25",       # update this date when you edit the entry
+    },
+    "ECB": { ... },
+    "BOE": { ... },
+    "BOJ": { ... },
+}
+```
+
+The agent warns `[!] STALE (Xd old)` in the regime output if an entry has not been updated in more than 14 days.
 
 ---
 
@@ -570,33 +606,25 @@ eurusd_agent/
 
 **"MT5 initialize() failed" on startup**
 
-The agent cannot connect to a running MetaTrader 5 terminal. Check that:
-- MetaTrader 5 is open and fully loaded, not just minimised to the system tray.
-- You are logged into your broker account inside MT5 (the terminal shows live prices).
-- You are running the agent on the same Windows machine as MT5. Remote connections are not supported.
+MetaTrader 5 must be open and fully loaded with a live broker connection. The agent connects to the already-running terminal — it does not launch MT5 itself.
 
 **"SLACK_APP_TOKEN not set — Slack bot will not start"**
 
-The `.env` file is missing one or both Slack bot tokens. Check that:
-- The `.env` file exists in the root of the `eurusd_agent` folder.
-- Both `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are present and have non-empty values.
-- You ran `conda activate mt5_env` before starting the agent (the `.env` file is loaded by the Python process, not by the shell).
+Check that both `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are in `.env` with non-empty values, and that you ran `conda activate mt5_env` before starting the agent.
 
-**Signal alerts appear in Slack but the approve/reject commands do nothing**
+**Signal alerts appear in Slack but approve/reject commands do nothing**
 
-This happens when the Slack bot (Socket Mode) is not running but the webhook is working. The webhook posts messages but cannot receive replies. Confirm that `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are both set in `.env` and that the agent startup log shows "Slack bot connected" rather than a warning about missing tokens.
+The webhook is working but Socket Mode is not. Confirm the startup log shows "Slack bot connected". Check that both Slack tokens are set in `.env`.
 
-**The agent starts but no Slack messages appear at all**
+**No Slack messages appear at all**
 
-Check `SLACK_WEBHOOK_URL` in `.env`. Make sure you copied the full URL including `https://`. Also confirm the bot has been invited to the channel with `/invite @EURUSD Agent`.
+Check `SLACK_WEBHOOK_URL` in `.env`. Confirm the bot has been invited to the channel with `/invite @Forex Agent`.
 
-**"Symbol EURUSD not found in MT5"**
+**"Symbol GBPUSD not found in MT5"**
 
-The EURUSD symbol is not visible in your MT5 Market Watch. Open MT5, go to View > Market Watch, right-click anywhere in the list, choose "Show All" or search for EURUSD, and add it. The agent requires the symbol to be visible before it can connect.
+The symbol is not in your MT5 Market Watch. In MT5: View → Market Watch → right-click → Show All, or search for the symbol and add it. Repeat for each active pair.
 
 **"ModuleNotFoundError: No module named 'MetaTrader5'"**
-
-The package was installed in the wrong Python environment. Run:
 
 ```bash
 conda activate mt5_env
@@ -605,37 +633,40 @@ pip install MetaTrader5
 
 **"ModuleNotFoundError: No module named 'slack_bolt'"**
 
-Same issue — the package is not in the active environment:
-
 ```bash
 conda activate mt5_env
 pip install slack-bolt
 ```
 
-**Job 2 is not checking positions even though MT5 is connected**
-
-Job 2 only runs during market hours (07:00–21:00 UTC on weekdays). It is paused from Friday 17:00 EST to Sunday 17:00 EST when the forex market is closed. To force an immediate check at any time, use the `positions` Slack command or run:
+**"ModuleNotFoundError: No module named 'pdfminer'"**
 
 ```bash
-python -c "from agents.job2_position import run_position_check; run_position_check()"
+conda activate mt5_env
+pip install pdfminer.six
 ```
 
-**Signals are expiring before you can approve them**
+This is required for Bank of Japan PDF statement extraction.
 
-The default expiry is 60 minutes (`JOB3_SIGNAL_EXPIRY_MINUTES` in `config.py`). If you are not always at your desk, increase this value. Be aware that a very old signal may propose a trade at prices that no longer reflect current conditions.
+**CB policy update shows "statement fetch failed" in the logs**
 
-**You want to change the scan frequency, risk percentage, or market hours**
+The central bank website may be temporarily unavailable or have changed its URL structure. The agent falls back to the last known values in `data/rate_cycles.json` (or `config.RATE_CYCLES` if the file is absent). This is non-critical — the regime engine continues to function with cached values.
 
-All tunable parameters are in `config.py`. The key ones:
+**Regime shows `[!] STALE` for a central bank**
 
-| Parameter | Default | What it controls |
-|-----------|---------|-----------------|
-| `SCAN_INTERVAL_MINUTES` | 30 | How often Job 1 scans news |
-| `TRIAGE_SCORE_THRESHOLD` | 6 | Minimum score to trigger a full analysis |
-| `COOLDOWN_MINUTES` | 45 | Silence period after a trigger fires |
-| `JOB2_CHECK_INTERVAL_MINUTES` | 30 | How often Job 2 checks open positions |
-| `JOB3_RISK_PCT` | 1.0 | Percentage of account equity risked per trade |
-| `JOB3_SIGNAL_EXPIRY_MINUTES` | 60 | How long a signal stays valid before auto-expiring |
-| `MARKET_HOURS_START` / `MARKET_HOURS_END` | 7 / 21 | Active scanning window (UTC hour) |
+Open `config.py`, update the relevant `RATE_CYCLES` entry with the latest stance, guidance, and expected moves, and update the `"updated"` date. The auto-updater may have failed to fetch the official statement; you can also manually trigger a fetch by restarting the agent after a CB headline appears in the news.
 
-Edit `config.py` and restart the agent for changes to take effect.
+**Job 2 is not checking positions**
+
+Job 2 only runs during market hours (07:00–23:00 UTC on weekdays). Force an immediate check with the `positions` Slack command.
+
+**Signals expire before you can approve them**
+
+Increase `JOB3_SIGNAL_EXPIRY_MINUTES` in `config.py`. Be aware that a very old signal may propose entry at prices that no longer reflect current conditions.
+
+**One pair keeps triggering repeatedly on the same news**
+
+Increase `COOLDOWN_MINUTES` in `config.py`. Cooldowns are per-pair, so changing this affects all pairs equally.
+
+**You want to monitor only EUR/USD (original single-pair mode)**
+
+Set `ACTIVE_PAIRS = ["EURUSD"]` in `config.py`. The system falls back to single-pair behaviour automatically.

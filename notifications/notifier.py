@@ -25,9 +25,16 @@ load_dotenv()
 logger = get_logger(__name__)
 
 
+def _get_display(signal: dict[str, Any]) -> str:
+    """Return the display name for the pair this signal belongs to."""
+    sym = signal.get("_symbol", config.MT5_SYMBOL)
+    return config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["display"]
+
+
 def _format_alert(signal: dict[str, Any], trigger_item: dict[str, Any] | None = None) -> str:
     """Format a signal dict into a human-readable alert string."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    display = _get_display(signal)
     levels = signal.get("key_levels") or {}
     support = levels.get("support", "N/A")
     resistance = levels.get("resistance", "N/A")
@@ -51,7 +58,7 @@ def _format_alert(signal: dict[str, Any], trigger_item: dict[str, Any] | None = 
 
     return (
         f"{'═' * 55}\n"
-        f"  EUR/USD SIGNAL ALERT — {now}\n"
+        f"  {display} SIGNAL ALERT — {now}\n"
         f"{'═' * 55}\n"
         f"  Signal     : {signal.get('signal', 'N/A')}\n"
         f"  Confidence : {signal.get('confidence', 'N/A')}\n"
@@ -103,10 +110,11 @@ def _notify_email(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
         logger.warning("SMTP credentials not set — skipping email notification")
         return
 
+    display = _get_display(signal)
     signal_label = signal.get("signal", "SIGNAL")
     confidence = signal.get("confidence", "")
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    subject = f"EUR/USD {signal_label} [{confidence}] — {now_str}"
+    subject = f"{display} {signal_label} [{confidence}] — {now_str}"
     body = _format_alert(signal, trigger_item)
 
     try:
@@ -133,6 +141,7 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
         return
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    display = _get_display(signal)
     levels = signal.get("key_levels") or {}
     support = levels.get("support", "N/A")
     resistance = levels.get("resistance", "N/A")
@@ -216,7 +225,7 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
         summary_lines += f"\n>*This week:* {week_sum}"
 
     text = (
-        f"{emoji} *EUR/USD {signal_label}* {confidence_emoji} `{confidence}` — "
+        f"{emoji} *{display} {signal_label}* {confidence_emoji} `{confidence}` — "
         f"_{signal.get('time_horizon', 'N/A')}_{source_label}\n"
         f"_{now}_{trigger_line}"
         f"{price_line}"
@@ -253,3 +262,25 @@ def notify(signal: dict[str, Any], trigger_item: dict[str, Any] | None = None) -
             _notify_email(signal, trigger_item)
         else:
             logger.warning(f"Unknown notification channel: {channel!r}")
+
+
+def notify_text(text: str) -> None:
+    """Send a plain-text message to all configured notification channels."""
+    for channel in config.NOTIFICATION_CHANNELS:
+        if channel == "print":
+            print(text)
+        elif channel == "slack":
+            webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+            if not webhook_url:
+                continue
+            try:
+                requests.post(
+                    webhook_url,
+                    data=json.dumps({"text": text}),
+                    headers={"Content-Type": "application/json"},
+                    timeout=10,
+                ).raise_for_status()
+            except Exception as e:
+                logger.error(f"notify_text Slack failed: {e}")
+        elif channel == "email":
+            logger.debug("notify_text: email channel skipped for plain-text messages")

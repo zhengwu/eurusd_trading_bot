@@ -30,10 +30,10 @@ def _get_client() -> anthropic.Anthropic:
     return _client
 
 
-_SYSTEM = "You are a forex market analyst specialising in EUR/USD."
+_SYSTEM_TEMPLATE = "You are a forex market analyst specialising in {display}."
 
 _PROMPT_TEMPLATE = """\
-Score each headline for its potential impact on EUR/USD in the next 4 hours.
+Score each headline for its potential impact on {display} in the next 4 hours.
 
 Scoring guide:
   9-10: Immediate major move likely (war, emergency CB rate decision, sovereign default,
@@ -43,19 +43,25 @@ Scoring guide:
   3-5:  Moderate — log only (scheduled data in line with forecasts, routine CB commentary)
   1-2:  Minimal impact (unrelated news, market colour, opinion pieces)
 
-Also assign one tag per headline:
-  geopolitical | CB_speech | macro_data | risk_off | risk_on | other
+Assign one tag per headline:
+  geopolitical | cb_decision | CB_speech | macro_data | risk_off | risk_on | other
+
+  cb_decision : confirmed rate decision or policy statement from a central bank meeting
+  CB_speech   : governor speech, press conference, interview, or unofficial commentary
+
+For ANY headline tagged cb_decision or CB_speech, also identify the central bank:
+  cb_bank: "Fed" | "ECB" | "BOE" | "BOJ" | null
 
 Headlines:
 {headlines_json}
 
 Return ONLY valid JSON, no other text:
 [
-  {{"headline": "...", "score": 8, "tag": "CB_speech", "reason": "..."}}
+  {{"headline": "...", "score": 8, "tag": "cb_decision", "cb_bank": "Fed", "reason": "..."}}
 ]"""
 
 
-def triage_headlines(headlines: list[str]) -> list[dict[str, Any]]:
+def triage_headlines(headlines: list[str], symbol: str | None = None) -> list[dict[str, Any]]:
     """
     Score a list of headlines using Claude Haiku.
     Returns list of {headline, score, tag, reason}.
@@ -64,8 +70,13 @@ def triage_headlines(headlines: list[str]) -> list[dict[str, Any]]:
     if not headlines:
         return []
 
+    sym = symbol or config.MT5_SYMBOL
+    display = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["display"]
+
+    system = _SYSTEM_TEMPLATE.format(display=display)
     prompt = _PROMPT_TEMPLATE.format(
-        headlines_json=json.dumps(headlines, ensure_ascii=False, indent=2)
+        display=display,
+        headlines_json=json.dumps(headlines, ensure_ascii=False, indent=2),
     )
 
     try:
@@ -74,7 +85,7 @@ def triage_headlines(headlines: list[str]) -> list[dict[str, Any]]:
             client.messages.create,
             model=config.TRIAGE_MODEL,
             max_tokens=1024,
-            system=_SYSTEM,
+            system=system,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
