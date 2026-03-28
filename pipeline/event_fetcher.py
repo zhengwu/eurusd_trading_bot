@@ -24,13 +24,22 @@ _HEADERS = {
     "Referer": "https://www.investing.com/",
 }
 
-# FRED series relevant to EUR/USD context
+# FRED series for all active pairs
 _FRED_SERIES = {
-    "CPIAUCSL": {"name": "US CPI",               "currency": "USD", "impact": "high"},
-    "UNRATE":   {"name": "US Unemployment Rate",  "currency": "USD", "impact": "high"},
-    "FEDFUNDS": {"name": "Federal Funds Rate",    "currency": "USD", "impact": "high"},
-    "GDP":      {"name": "US Real GDP",           "currency": "USD", "impact": "high"},
-    "PAYEMS":   {"name": "US Nonfarm Payrolls",   "currency": "USD", "impact": "high"},
+    # USD
+    "CPIAUCSL":        {"name": "US CPI",               "currency": "USD", "impact": "high"},
+    "UNRATE":          {"name": "US Unemployment Rate",  "currency": "USD", "impact": "high"},
+    "FEDFUNDS":        {"name": "Federal Funds Rate",    "currency": "USD", "impact": "high"},
+    "GDP":             {"name": "US Real GDP",           "currency": "USD", "impact": "high"},
+    "PAYEMS":          {"name": "US Nonfarm Payrolls",   "currency": "USD", "impact": "high"},
+    # GBP
+    "CPALTT01GBM657N": {"name": "UK CPI",                "currency": "GBP", "impact": "high"},
+    "LRHUTTTTGBM156S": {"name": "UK Unemployment Rate",  "currency": "GBP", "impact": "high"},
+    "IRLTLT01GBM156N": {"name": "UK 10Y Gilt Yield",     "currency": "GBP", "impact": "medium"},
+    # JPY
+    "CPALTT01JPM657N": {"name": "Japan CPI",             "currency": "JPY", "impact": "high"},
+    "LRUNTTTTJPM156S": {"name": "Japan Unemployment",    "currency": "JPY", "impact": "medium"},
+    "IRLTLT01JPM156N": {"name": "Japan 10Y Bond Yield",  "currency": "JPY", "impact": "high"},
 }
 
 
@@ -104,7 +113,7 @@ def fetch_forexfactory_calendar() -> list[dict[str, Any]]:
         for item in raw:
             try:
                 currency = item.get("country", "").upper()
-                if currency not in ("USD", "EUR"):
+                if currency not in ("USD", "EUR", "GBP", "JPY"):
                     continue
 
                 impact_raw = item.get("impact", "").lower()
@@ -153,7 +162,7 @@ def fetch_forexfactory_calendar() -> list[dict[str, Any]]:
             except Exception:
                 continue
 
-        logger.info(f"ForexFactory: fetched {len(events)} USD/EUR events this week")
+        logger.info(f"ForexFactory: fetched {len(events)} USD/EUR/GBP/JPY events this week")
         return events
     except Exception as e:
         logger.warning(f"ForexFactory calendar fetch failed: {e}")

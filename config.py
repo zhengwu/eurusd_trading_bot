@@ -7,11 +7,25 @@ COOLDOWN_MINUTES = 45            # Minutes to suppress re-trigger after escalati
 SCAN_INTERVAL_MINUTES = 30       # How often Tier 1 runs
 
 # ── Models ────────────────────────────────────────────────────────────────────
-TRIAGE_MODEL = "claude-haiku-4-5-20251001"
+TRIAGE_MODEL   = "claude-haiku-4-5-20251001"
 ANALYSIS_MODEL = "claude-sonnet-4-6"
+
+# Debate persona model — runs 3 concurrent calls, so cost/latency matters.
+# Haiku is fast and cheap; upgrade to Sonnet or Opus for higher-quality arguments.
+# DEBATE_PERSONA_MODEL = "claude-opus-4-6"        # Advanced — richest persona arguments
+# DEBATE_PERSONA_MODEL = "claude-sonnet-4-6"      # Balanced — good quality, moderate cost
+DEBATE_PERSONA_MODEL   = "claude-haiku-4-5-20251001"  # Fast/cheap — good enough for focused persona tasks
+
+# Debate judge model — the synthesis step; quality matters more here than for personas.
+# DEBATE_JUDGE_MODEL = "claude-opus-4-6"          # Advanced — sharpest CIO judgment
+DEBATE_JUDGE_MODEL     = "claude-sonnet-4-6"      # Balanced — strong reasoning at moderate cost
 
 # ── Regime Engine ──────────────────────────────────────────────────────────────
 USE_REGIME_ANALYSIS = True   # Inject regime summary into LLM context window
+
+# ── Multi-Agent Debate / Ensemble ─────────────────────────────────────────────
+USE_MULTI_AGENT_DEBATE  = True   # Run Bull/Bear/Devil's Advocate debate on Long/Short signals
+DEBATE_MAX_UNCERTAINTY  = 70     # Signals with uncertainty_score > this are downgraded to Wait
 
 # Central bank rate cycles — update after each meeting or major policy speech.
 #   stance   : "Hiking" | "Pausing" | "Cutting"

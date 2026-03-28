@@ -1,6 +1,6 @@
-"""Cooldown lock — suppresses re-trigger of full analysis for COOLDOWN_MINUTES.
+"""Per-symbol cooldown lock — suppresses re-trigger of full analysis for COOLDOWN_MINUTES.
 
-Backed by a timestamp file: data/.cooldown_lock
+Backed by timestamp files: data/.cooldown_SYMBOL (one per pair).
 """
 from __future__ import annotations
 
@@ -12,15 +12,19 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_LOCK_FILE = config.DATA_DIR / ".cooldown_lock"
+
+def _lock_file(symbol: str) -> Path:
+    return config.DATA_DIR / f".cooldown_{symbol}"
 
 
-def is_cooling_down() -> bool:
-    """Return True if the cooldown window is still active."""
-    if not _LOCK_FILE.exists():
+def is_cooling_down(symbol: str | None = None) -> bool:
+    """Return True if the cooldown window is still active for the given symbol."""
+    sym = symbol or config.MT5_SYMBOL
+    lock = _lock_file(sym)
+    if not lock.exists():
         return False
     try:
-        ts_str = _LOCK_FILE.read_text(encoding="utf-8").strip()
+        ts_str = lock.read_text(encoding="utf-8").strip()
         lock_time = datetime.fromisoformat(ts_str)
         if lock_time.tzinfo is None:
             lock_time = lock_time.replace(tzinfo=timezone.utc)
@@ -28,28 +32,32 @@ def is_cooling_down() -> bool:
         now = datetime.now(timezone.utc)
         if now < expiry:
             remaining = int((expiry - now).total_seconds() / 60)
-            logger.debug(f"Cooldown active — {remaining} min remaining")
+            logger.debug(f"Cooldown active [{sym}] — {remaining} min remaining")
             return True
         return False
     except Exception as e:
-        logger.warning(f"Cooldown check failed: {e}")
+        logger.warning(f"Cooldown check failed [{sym}]: {e}")
         return False
 
 
-def set_cooldown() -> None:
-    """Set the cooldown lock to now."""
+def set_cooldown(symbol: str | None = None) -> None:
+    """Set the cooldown lock to now for the given symbol."""
+    sym = symbol or config.MT5_SYMBOL
+    lock = _lock_file(sym)
     try:
-        _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _LOCK_FILE.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
-        logger.info(f"Cooldown set for {config.COOLDOWN_MINUTES} minutes")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+        logger.info(f"Cooldown set [{sym}] for {config.COOLDOWN_MINUTES} minutes")
     except Exception as e:
-        logger.error(f"Failed to set cooldown: {e}")
+        logger.error(f"Failed to set cooldown [{sym}]: {e}")
 
 
-def clear_cooldown() -> None:
-    """Remove the cooldown lock (e.g. for testing)."""
+def clear_cooldown(symbol: str | None = None) -> None:
+    """Remove the cooldown lock for the given symbol (e.g. for testing)."""
+    sym = symbol or config.MT5_SYMBOL
+    lock = _lock_file(sym)
     try:
-        if _LOCK_FILE.exists():
-            _LOCK_FILE.unlink()
+        if lock.exists():
+            lock.unlink()
     except Exception as e:
-        logger.warning(f"Failed to clear cooldown: {e}")
+        logger.warning(f"Failed to clear cooldown [{sym}]: {e}")

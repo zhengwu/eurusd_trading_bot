@@ -77,6 +77,7 @@ def _format_alert(signal: dict[str, Any], trigger_item: dict[str, Any] | None = 
         f"\n  Invalidation:\n  {signal.get('invalidation', '')}\n"
         f"\n  Risk Note:\n  {signal.get('risk_note', '')}\n"
         + _fmt_order_preview(signal.get("_order_preview"))
+        + _fmt_debate(signal.get("_debate"), signal.get("_uncertainty_score"), signal.get("_debate_veto"))
         + f"{'═' * 55}"
     )
 
@@ -93,6 +94,60 @@ def _fmt_order_preview(preview: dict | None) -> str:
         f"    Lot        : {preview.get('lot_size', '—')}\n"
         f"    Risk       : ${preview.get('risk_amount', '—')}\n"
         f"    R:R        : {preview.get('risk_reward', '—')}\n"
+    )
+
+
+def _fmt_debate(
+    debate: dict | None,
+    uncertainty: int | None,
+    veto_reason: str | None,
+) -> str:
+    if not debate:
+        return ""
+    evals    = debate.get("evaluations") or {}
+    bull     = evals.get("bull_score", "?")
+    bear     = evals.get("bear_score", "?")
+    neut     = evals.get("neutral_score", "?")
+    win      = evals.get("winning_case", "?")
+    flaws    = evals.get("flaws", "")
+    unc      = uncertainty if uncertainty is not None else debate.get("uncertainty_score", "?")
+    rat      = debate.get("uncertainty_rationale", "")
+    final_d  = debate.get("final_decision", "")
+    conf_ov  = debate.get("confidence_override") or ""
+    setup    = debate.get("trade_setup") or {}
+    entry_as = setup.get("entry_assessment", "")
+    sl_ass   = setup.get("sl_assessment", "")
+    tp_ass   = setup.get("tp_assessment", "")
+    sl_adj   = setup.get("suggested_sl_adjustment")
+    tp_adj   = setup.get("suggested_tp_adjustment")
+    veto     = f"\n  [!] VETO: {veto_reason}\n" if veto_reason else ""
+
+    conf_str = f" [{conf_ov}]" if conf_ov and conf_ov != "null" else ""
+    adj_line = ""
+    if sl_adj or tp_adj:
+        adj_line = (
+            f"\n  Adjustments:\n"
+            + (f"    SL adjusted -> {sl_adj}\n" if sl_adj else "")
+            + (f"    TP adjusted -> {tp_adj}\n" if tp_adj else "")
+        )
+    assess_lines = ""
+    if entry_as:
+        assess_lines += f"    Entry      : {entry_as}\n"
+    if sl_ass:
+        assess_lines += f"    SL         : {sl_ass}\n"
+    if tp_ass:
+        assess_lines += f"    TP         : {tp_ass}\n"
+
+    return (
+        f"\n  Ensemble Debate:\n"
+        f"    Scores     : Bull {bull} | Bear {bear} | Neutral {neut} | Winner: {win}\n"
+        f"    Uncertainty: {unc}/100\n"
+        f"    Rationale  : {rat}\n"
+        + (f"    Flaws      : {flaws}\n" if flaws else "")
+        + (f"    Verdict    : {final_d}{conf_str}\n" if final_d else "")
+        + (f"  Trade Setup Assessment:\n" + assess_lines if assess_lines else "")
+        + adj_line
+        + veto
     )
 
 
@@ -183,6 +238,66 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
             f">Lot `{lot}`  Risk `${risk}`  R:R `{rr}`"
         )
 
+    # Ensemble debate block
+    debate      = signal.get("_debate") or {}
+    debate_line = ""
+    if debate:
+        evals    = debate.get("evaluations") or {}
+        bull_s   = evals.get("bull_score", "?")
+        bear_s   = evals.get("bear_score", "?")
+        neut_s   = evals.get("neutral_score", "?")
+        win      = evals.get("winning_case", "?")
+        flaws    = evals.get("flaws", "")
+        unc      = signal.get("_uncertainty_score", debate.get("uncertainty_score", "?"))
+        unc_rat  = debate.get("uncertainty_rationale", "")
+        final_d  = debate.get("final_decision", "")
+        conf_ov  = debate.get("confidence_override") or ""
+        veto     = signal.get("_debate_veto", "")
+        setup    = debate.get("trade_setup") or {}
+        entry_as = setup.get("entry_assessment", "")
+        sl_ass   = setup.get("sl_assessment", "")
+        tp_ass   = setup.get("tp_assessment", "")
+        sl_adj   = setup.get("suggested_sl_adjustment")
+        tp_adj   = setup.get("suggested_tp_adjustment")
+
+        unc_emoji = (
+            ":large_green_circle:" if isinstance(unc, int) and unc <= 39 else
+            ":large_yellow_circle:" if isinstance(unc, int) and unc <= 69 else
+            ":red_circle:"
+        )
+        dec_emoji = {
+            "Long":  ":chart_with_upwards_trend:",
+            "Short": ":chart_with_downwards_trend:",
+            "Wait":  ":pause_button:",
+        }.get(final_d, ":scales:")
+
+        debate_line = (
+            f"\n\n*Ensemble Debate — Long/Short/Wait?*\n"
+            f">:chart_with_upwards_trend: Bull `{bull_s}` | "
+            f":chart_with_downwards_trend: Bear `{bear_s}` | "
+            f":scales: Neutral `{neut_s}` | Winner: *{win}*\n"
+            f">{unc_emoji} *Uncertainty:* `{unc}/100` — {unc_rat}"
+        )
+        if flaws:
+            debate_line += f"\n>:speech_balloon: _{flaws}_"
+        if final_d:
+            conf_str = f" [{conf_ov}]" if conf_ov and conf_ov != "null" else ""
+            debate_line += f"\n\n{dec_emoji} *Judge verdict: {final_d}*{conf_str}"
+        if entry_as:
+            debate_line += f"\n>:mag: Entry: {entry_as}"
+        if sl_ass:
+            debate_line += f"\n>:mag: SL: {sl_ass}"
+        if tp_ass:
+            debate_line += f"\n>:mag: TP: {tp_ass}"
+        if sl_adj or tp_adj:
+            debate_line += (
+                "\n>:wrench: *Adjustments:*"
+                + (f" SL -> `{sl_adj}`" if sl_adj else "")
+                + (f" TP -> `{tp_adj}`" if tp_adj else "")
+            )
+        if veto:
+            debate_line += f"\n>:no_entry: *{veto}*"
+
     # Show signal ID + approval / chat instructions
     signal_id = signal.get("_signal_id")
     source = signal.get("_source", "job1")
@@ -235,6 +350,7 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
         f">*Invalidation:* {signal.get('invalidation', '')}\n"
         f">*Risk Note:* {signal.get('risk_note', '')}"
         f"{order_line}"
+        f"{debate_line}"
         f"{approval_line}"
     )
 
@@ -262,6 +378,14 @@ def notify(signal: dict[str, Any], trigger_item: dict[str, Any] | None = None) -
             _notify_email(signal, trigger_item)
         else:
             logger.warning(f"Unknown notification channel: {channel!r}")
+
+    # Record Long/Short signals in the trade journal
+    if signal.get("signal") in ("Long", "Short") and signal.get("_signal_id"):
+        try:
+            from analysis.trade_journal import record_signal
+            record_signal(signal)
+        except Exception as e:
+            logger.error(f"Journal record_signal failed: {e}")
 
 
 def notify_text(text: str) -> None:

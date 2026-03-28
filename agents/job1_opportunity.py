@@ -105,7 +105,8 @@ def _job2_thread() -> None:
 def main() -> None:
     _disable_quickedit()
     logger.info("=" * 60)
-    logger.info("EUR/USD Opportunity Scanner — Job 1")
+    logger.info("Forex Multi-Pair Agent — Job 1")
+    logger.info(f"  Active pairs  : {config.ACTIVE_PAIRS}")
     logger.info(f"  Triage model  : {config.TRIAGE_MODEL}")
     logger.info(f"  Analysis model: {config.ANALYSIS_MODEL}")
     logger.info(f"  Scan interval : {config.SCAN_INTERVAL_MINUTES} min")

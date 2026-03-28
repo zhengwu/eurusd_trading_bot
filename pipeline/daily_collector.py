@@ -138,8 +138,17 @@ def generate_summary(date_str: str) -> None:
     )
 
     eurusd = prices.get("EURUSD") or {}
+    import config as _config
+    active_pairs_str = ", ".join(_config.ACTIVE_PAIRS)
+    pair_closes = "  ".join(
+        f"{sym}: close={( prices.get(sym) or {}).get('close')} "
+        f"pct_change={( prices.get(sym) or {}).get('pct_change')}%"
+        for sym in _config.ACTIVE_PAIRS
+    )
+
     prompt = f"""\
-Write a concise end-of-day market summary for EUR/USD traders.
+Write a concise end-of-day market summary for forex traders.
+Active pairs: {active_pairs_str}
 
 Date: {date_str}
 
@@ -149,14 +158,15 @@ Key headlines today:
 Economic events:
 {events_text or '(none)'}
 
-EUR/USD: close={eurusd.get('close')} pct_change={eurusd.get('pct_change')}%
+Pair closes:
+{pair_closes}
 DXY: {(prices.get('DXY') or {}).get('close')}  \
 VIX: {(prices.get('VIX') or {}).get('close')}  \
 Gold: {(prices.get('Gold') or {}).get('close')}  \
 US10Y: {(prices.get('US10Y') or {}).get('close')}
 
 Write 4-6 bullet points covering: dominant theme, key data releases/surprises, \
-EUR/USD price range and close, risk sentiment, and what to watch tomorrow.
+price action across active pairs, risk sentiment, and what to watch tomorrow.
 Format as markdown bullet points under the heading: ## Market Summary — {date_str}"""
 
     try:
@@ -184,6 +194,14 @@ def run_daily_collection(date_str: str | None = None) -> None:
     collect_events(date_str)
     merge_intraday_to_news(date_str)
     generate_summary(date_str)
+
+    # Validate trade journal — check closed positions and hypothetical outcomes
+    try:
+        from analysis.trade_journal import validate_pending
+        n = validate_pending()
+        logger.info(f"Journal: {n} record(s) validated")
+    except Exception as e:
+        logger.error(f"Journal validation failed: {e}")
 
     # Clear dedup cache so next day starts fresh
     cache = DedupCache(config.DATA_DIR / ".dedup_cache")

@@ -32,7 +32,7 @@ import config
 from mt5.connector import connect, disconnect, is_connected
 from mt5.position_reader import get_current_tick, get_open_positions
 from mt5.risk_manager import calculate_lot_size, calculate_sl_tp, sl_pips_from_price
-from mt5.order_manager import open_position, close_position
+from mt5.order_manager import open_position, close_position, place_limit_order
 from pipeline.signal_store import (
     approve_signal,
     get_signal_by_id,
@@ -63,14 +63,22 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
     if action in ("Long", "Short"):
         direction = "buy" if action == "Long" else "sell"
 
-        tick = get_current_tick()
-        if tick is None:
-            return {"ok": False, "error": "No tick data available"}
-        current_price = tick["ask"] if direction == "buy" else tick["bid"]
+        symbol = signal.get("_symbol", config.MT5_SYMBOL)
+        limit_price = signal.get("_limit_price")
 
-        sl_price, tp_price = calculate_sl_tp(signal, current_price, direction)
+        # For SL/TP and lot calculation, use limit price as reference if set,
+        # otherwise use the live tick.
+        if limit_price:
+            current_price = float(limit_price)
+        else:
+            tick = get_current_tick(symbol=symbol)
+            if tick is None:
+                return {"ok": False, "error": "No tick data available"}
+            current_price = tick["ask"] if direction == "buy" else tick["bid"]
 
-        sl_pips = sl_pips_from_price(sl_price, current_price, direction)
+        sl_price, tp_price = calculate_sl_tp(signal, current_price, direction, symbol=symbol)
+
+        sl_pips = sl_pips_from_price(sl_price, current_price, direction, symbol=symbol)
         if sl_pips < 1:
             sl_pips = config.JOB3_DEFAULT_SL_PIPS
 
@@ -78,16 +86,29 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
         if account_info is None:
             return {"ok": False, "error": "Cannot read account equity"}
 
-        lot = calculate_lot_size(account_info, config.JOB3_RISK_PCT, sl_pips)
-
-        result = open_position(
-            symbol=config.MT5_SYMBOL,
-            direction=direction,
-            lot=lot,
-            sl=sl_price,
-            tp=tp_price,
-            comment=f"job1_{signal.get('id', '')}",
+        lot = signal.get("_lot_override") or calculate_lot_size(
+            account_info, config.JOB3_RISK_PCT, sl_pips, symbol=symbol
         )
+
+        if limit_price:
+            result = place_limit_order(
+                symbol=symbol,
+                direction=direction,
+                lot=lot,
+                price=float(limit_price),
+                sl=sl_price,
+                tp=tp_price,
+                comment=f"job1_{signal.get('id', '')}",
+            )
+        else:
+            result = open_position(
+                symbol=symbol,
+                direction=direction,
+                lot=lot,
+                sl=sl_price,
+                tp=tp_price,
+                comment=f"job1_{signal.get('id', '')}",
+            )
         return result
 
     # ── Job 2: Exit — close full position ──────────────────────────────────
@@ -103,7 +124,8 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
         if ticket is None:
             return {"ok": False, "error": "No ticket in Trim signal"}
 
-        positions = get_open_positions(symbol=config.MT5_SYMBOL)
+        trim_symbol = signal.get("_symbol", config.MT5_SYMBOL)
+        positions = get_open_positions(symbol=trim_symbol)
         pos = next((p for p in positions if p["ticket"] == int(ticket)), None)
         if pos is None:
             return {"ok": False, "error": f"Position #{ticket} not found"}
@@ -147,7 +169,7 @@ def _get_equity() -> float | None:
         return None
 
 
-def compute_order_preview(signal: dict[str, Any]) -> dict[str, Any] | None:
+def compute_order_preview(signal: dict[str, Any], symbol: str | None = None) -> dict[str, Any] | None:
     """
     Compute the full order details for a pending Long/Short signal:
     entry price, SL, TP, lot size, risk amount, R:R ratio.
@@ -160,10 +182,13 @@ def compute_order_preview(signal: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     try:
+        sym = symbol or signal.get("_symbol", config.MT5_SYMBOL)
+        pip = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["pip"]
+        decimals = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["price_decimals"]
         direction = "buy" if action == "Long" else "sell"
 
         # Try live tick first, fall back gracefully
-        tick = get_current_tick() if is_connected() else None
+        tick = get_current_tick(symbol=sym) if is_connected() else None
         if tick:
             current_price = tick["ask"] if direction == "buy" else tick["bid"]
         else:
@@ -172,26 +197,26 @@ def compute_order_preview(signal: dict[str, Any]) -> dict[str, Any] | None:
             sup = levels.get("support")
             res = levels.get("resistance")
             if sup and res:
-                current_price = round((float(sup) + float(res)) / 2, 5)
+                current_price = round((float(sup) + float(res)) / 2, decimals)
             else:
                 return None  # can't compute without any price reference
 
-        sl_price, tp_price = calculate_sl_tp(signal, current_price, direction)
-        sl_pips = sl_pips_from_price(sl_price, current_price, direction)
+        sl_price, tp_price = calculate_sl_tp(signal, current_price, direction, symbol=sym)
+        sl_pips = sl_pips_from_price(sl_price, current_price, direction, symbol=sym)
         if sl_pips < 1:
             sl_pips = config.JOB3_DEFAULT_SL_PIPS
 
         equity = _get_equity()
-        lot = calculate_lot_size(equity or 10000.0, config.JOB3_RISK_PCT, sl_pips)
+        lot = calculate_lot_size(equity or 10000.0, config.JOB3_RISK_PCT, sl_pips, symbol=sym)
         risk_amount = round((equity or 0) * config.JOB3_RISK_PCT / 100, 2)
 
-        tp_pips = abs(tp_price - current_price) / 0.0001 if tp_price else None
+        tp_pips = abs(tp_price - current_price) / pip if tp_price else None
         rr = round(tp_pips / sl_pips, 2) if tp_pips and sl_pips > 0 else None
 
         return {
-            "entry_price": round(current_price, 5),
-            "sl":          round(sl_price, 5) if sl_price else None,
-            "tp":          round(tp_price, 5) if tp_price else None,
+            "entry_price": round(current_price, decimals),
+            "sl":          round(sl_price, decimals) if sl_price else None,
+            "tp":          round(tp_price, decimals) if tp_price else None,
             "sl_pips":     round(sl_pips, 1),
             "tp_pips":     round(tp_pips, 1) if tp_pips else None,
             "lot_size":    lot,
@@ -237,11 +262,17 @@ def run_executor_once() -> int:
 
 # ── Slack-callable helper ─────────────────────────────────────────────────────
 
-def approve_and_execute(signal_id: str, trim_pct: float | None = None) -> dict[str, Any]:
+def approve_and_execute(
+    signal_id: str,
+    trim_pct: float | None = None,
+    limit_price: float | None = None,
+) -> dict[str, Any]:
     """
     Approve a pending signal and immediately execute it.
     Called directly from the Slack bot after user approval.
-    trim_pct: percentage of position to close for Trim signals (e.g. 25 = 25%).
+    trim_pct:    percentage of position to close for Trim signals (e.g. 25 = 25%).
+    limit_price: if set, place a Buy/Sell Limit pending order at this price instead
+                 of a market order.
     Returns a result dict suitable for sending back to Slack.
     """
     signal = get_signal_by_id(signal_id)
@@ -257,8 +288,21 @@ def approve_and_execute(signal_id: str, trim_pct: float | None = None) -> dict[s
     if not is_connected():
         return {"ok": False, "error": "MT5 is not connected — signal approved but not executed"}
 
+    # Inject limit price so execute_signal routes to place_limit_order
+    if limit_price is not None:
+        signal = {**signal, "_limit_price": limit_price}
+
     result = execute_signal(signal, trim_pct=trim_pct)
     mark_executed(signal_id, result)
+
+    # Link MT5 ticket to trade journal on success
+    if result.get("ok") and result.get("ticket"):
+        try:
+            from analysis.trade_journal import link_ticket
+            link_ticket(signal_id, result["ticket"])
+        except Exception as e:
+            logger.error(f"Journal link_ticket failed: {e}")
+
     return result
 
 

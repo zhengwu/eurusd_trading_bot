@@ -153,6 +153,63 @@ def close_position(ticket: int, lot: float | None = None) -> dict[str, Any]:
     }
 
 
+def place_limit_order(
+    symbol: str,
+    direction: str,          # "buy" or "sell"
+    lot: float,
+    price: float,            # limit price — fills only when market reaches this level
+    sl: float | None = None,
+    tp: float | None = None,
+    comment: str = "eurusd_agent",
+) -> dict[str, Any]:
+    """
+    Place a pending limit order (Buy Limit / Sell Limit).
+    The order sits in the MT5 order book until the market reaches `price`.
+    Returns the same result dict shape as open_position().
+    """
+    order_type = mt5.ORDER_TYPE_BUY_LIMIT if direction == "buy" else mt5.ORDER_TYPE_SELL_LIMIT
+
+    request = {
+        "action":       mt5.TRADE_ACTION_PENDING,
+        "symbol":       symbol,
+        "volume":       lot,
+        "type":         order_type,
+        "price":        price,
+        "magic":        config.MT5_MAGIC_NUMBER,
+        "comment":      comment,
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": _filling_mode(symbol),
+    }
+    if sl is not None:
+        request["sl"] = sl
+    if tp is not None:
+        request["tp"] = tp
+
+    logger.info(
+        f"Sending limit order: {direction.upper()} {lot} {symbol} "
+        f"@ limit {price} SL={sl} TP={tp}"
+    )
+
+    result = mt5.order_send(request)
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        error = _last_error_str() if result is None else f"retcode={result.retcode}"
+        logger.error(f"Limit order failed: {error}")
+        return {"ok": False, "error": error}
+
+    logger.info(
+        f"Limit order placed: ticket={result.order} "
+        f"{direction.upper()} {lot} {symbol} @ limit {price}"
+    )
+    return {
+        "ok":         True,
+        "ticket":     result.order,
+        "price":      price,
+        "volume":     lot,
+        "direction":  direction,
+        "order_type": "limit",
+    }
+
+
 def modify_sl_tp(
     ticket: int,
     sl: float | None = None,

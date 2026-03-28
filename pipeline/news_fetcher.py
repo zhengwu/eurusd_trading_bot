@@ -24,6 +24,68 @@ from utils.logger import get_logger
 load_dotenv()
 logger = get_logger(__name__)
 
+# ── Per-pair news query config ─────────────────────────────────────────────────
+_PAIR_NEWS: dict[str, dict] = {
+    "EURUSD": {
+        "newsapi_pair":    '"EUR/USD" OR "EURUSD" OR (euro AND dollar)',
+        "newsapi_cb":      (
+            'ECB OR Fed OR "European Central Bank" OR "Federal Reserve" OR '
+            'Eurozone OR "euro area" OR Germany OR France OR "EU economy"'
+        ),
+        "av_patterns":     [
+            r"\bEUR\b", r"\bUSD\b", r"\beuro\b", r"\bdollar\b",
+            r"\bECB\b", r"\bFed\b", r"\bforex\b",
+            r"\bEurozone\b", r"\bGermany\b", r"\bEuropean\b",
+        ],
+        "eodhd_ticker":    "EURUSD.FOREX",
+    },
+    "GBPUSD": {
+        "newsapi_pair":    '"GBP/USD" OR "GBPUSD" OR "cable" OR (pound AND dollar)',
+        "newsapi_cb":      (
+            'BOE OR "Bank of England" OR Fed OR "Federal Reserve" OR '
+            '"UK economy" OR "British economy" OR Brexit OR "UK inflation" OR "UK GDP"'
+        ),
+        "av_patterns":     [
+            r"\bGBP\b", r"\bUSD\b", r"\bpound\b", r"\bdollar\b",
+            r"\bBOE\b", r"\bFed\b", r"\bforex\b",
+            r"\bUK\b", r"\bBritish\b", r"\bBrexit\b",
+        ],
+        "eodhd_ticker":    "GBPUSD.FOREX",
+    },
+    "USDJPY": {
+        "newsapi_pair":    '"USD/JPY" OR "USDJPY" OR (dollar AND yen)',
+        "newsapi_cb":      (
+            'BOJ OR "Bank of Japan" OR Fed OR "Federal Reserve" OR YCC OR '
+            '"Japan economy" OR "Japanese economy" OR "safe haven" OR Nikkei'
+        ),
+        "av_patterns":     [
+            r"\bJPY\b", r"\bUSD\b", r"\byen\b", r"\bdollar\b",
+            r"\bBOJ\b", r"\bFed\b", r"\bforex\b",
+            r"\bJapan\b", r"\bJapanese\b", r"\bNikkei\b",
+        ],
+        "eodhd_ticker":    "USDJPY.FOREX",
+    },
+    "AUDUSD": {
+        "newsapi_pair":    '"AUD/USD" OR "AUDUSD" OR (aussie AND dollar)',
+        "newsapi_cb":      (
+            'RBA OR "Reserve Bank of Australia" OR Fed OR "Federal Reserve" OR '
+            '"Australian economy" OR "China GDP" OR "iron ore" OR commodity'
+        ),
+        "av_patterns":     [
+            r"\bAUD\b", r"\bUSD\b", r"\baussie\b", r"\bdollar\b",
+            r"\bRBA\b", r"\bFed\b", r"\bforex\b",
+            r"\bAustralia\b", r"\bAustralian\b", r"\bChina\b",
+        ],
+        "eodhd_ticker":    "AUDUSD.FOREX",
+    },
+}
+
+
+def _pair_news_cfg(symbol: str) -> dict:
+    """Return news query config for a symbol, falling back to EURUSD defaults."""
+    return _PAIR_NEWS.get(symbol, _PAIR_NEWS["EURUSD"])
+
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -107,22 +169,23 @@ def fetch_article_text(url: str, max_chars: int = 3000) -> str:
 
 # ── NewsAPI ───────────────────────────────────────────────────────────────────
 
-def _newsapi_query() -> str:
-    pair_block = '"EUR/USD" OR "EURUSD" OR (euro AND dollar)'
+def _newsapi_query(symbol: str = "EURUSD") -> str:
+    cfg = _pair_news_cfg(symbol)
     intent_block = (
-        'forex OR fx OR "exchange rate" OR "central bank" OR '
-        '"interest rate" OR "rate cut" OR "rate hike" OR inflation OR CPI OR GDP OR ECB OR Fed'
+        'inflation OR CPI OR GDP OR NFP OR payrolls OR '
+        '"rate cut" OR "rate hike" OR "interest rate" OR '
+        '"central bank" OR geopolitical OR "risk off"'
     )
-    return f"({pair_block}) AND ({intent_block})"
+    return f"({cfg['newsapi_pair']}) AND ({cfg['newsapi_cb']} OR {intent_block})"
 
 
-def fetch_newsapi(start: date, end: date, max_items: int) -> list[dict[str, Any]]:
+def fetch_newsapi(start: date, end: date, max_items: int, symbol: str = "EURUSD") -> list[dict[str, Any]]:
     key = os.getenv("NEWS_API_KEY")
     if not key:
         logger.warning("NEWS_API_KEY not set — skipping NewsAPI")
         return []
     params = {
-        "q": _newsapi_query(),
+        "q": _newsapi_query(symbol),
         "language": "en",
         "sortBy": "publishedAt",
         "pageSize": min(max_items, 100),
@@ -166,7 +229,7 @@ def fetch_newsapi(start: date, end: date, max_items: int) -> list[dict[str, Any]
 
 # ── Alpha Vantage NEWS_SENTIMENT ──────────────────────────────────────────────
 
-def fetch_alphavantage(start: date, end: date, max_items: int) -> list[dict[str, Any]]:
+def fetch_alphavantage(start: date, end: date, max_items: int, symbol: str = "EURUSD") -> list[dict[str, Any]]:
     key = os.getenv("ALPHA_VANTAGE_API_KEY")
     if not key:
         logger.warning("ALPHA_VANTAGE_API_KEY not set — skipping Alpha Vantage")
@@ -216,8 +279,8 @@ def fetch_alphavantage(start: date, end: date, max_items: int) -> list[dict[str,
     if not isinstance(feed, list):
         return []
 
-    # Filter for EUR/USD relevance by keyword matching
-    patterns = [r"\bEUR\b", r"\bUSD\b", r"\beuro\b", r"\bdollar\b", r"\bECB\b", r"\bFed\b", r"\bforex\b"]
+    # Filter for pair relevance by keyword matching
+    patterns = _pair_news_cfg(symbol)["av_patterns"]
     out = []
     seen: set[str] = set()
     for a in feed:
@@ -248,13 +311,13 @@ def fetch_alphavantage(start: date, end: date, max_items: int) -> list[dict[str,
 
 # ── EODHD ─────────────────────────────────────────────────────────────────────
 
-def fetch_eodhd(start: date, end: date, max_items: int) -> list[dict[str, Any]]:
+def fetch_eodhd(start: date, end: date, max_items: int, symbol: str = "EURUSD") -> list[dict[str, Any]]:
     key = os.getenv("EODHD_API_KEY")
     if not key:
         logger.warning("EODHD_API_KEY not set — skipping EODHD")
         return []
     params = {
-        "s": "EURUSD.FOREX",
+        "s": _pair_news_cfg(symbol)["eodhd_ticker"],
         "offset": 0,
         "limit": max_items,
         "from": start.isoformat(),
@@ -306,12 +369,14 @@ def fetch_eodhd(start: date, end: date, max_items: int) -> list[dict[str, Any]]:
 def fetch_news(
     days_back: int | None = None,
     max_per_provider: int | None = None,
+    symbol: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Fetch EUR/USD news from all configured providers.
+    Fetch forex news from all configured providers for the given symbol.
     Returns normalized list deduplicated by URL within this batch.
     Per-day dedup against already-processed articles is done by DedupCache.
     """
+    sym = symbol or config.MT5_SYMBOL
     days_back = days_back or config.NEWS_WINDOW_DAYS
     max_per_provider = max_per_provider or config.NEWS_PER_PROVIDER_MAX_ITEMS
     today = datetime.now(timezone.utc).date()
@@ -320,9 +385,9 @@ def fetch_news(
     all_items: list[dict[str, Any]] = []
     for fetch_fn in [fetch_newsapi, fetch_alphavantage, fetch_eodhd]:
         try:
-            items = fetch_fn(start, today, max_per_provider)
+            items = fetch_fn(start, today, max_per_provider, sym)
             all_items.extend(items)
-            logger.debug(f"{fetch_fn.__name__}: {len(items)} items")
+            logger.debug(f"{fetch_fn.__name__} [{sym}]: {len(items)} items")
         except Exception as e:
             logger.error(f"{fetch_fn.__name__} failed: {e}")
 

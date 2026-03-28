@@ -220,9 +220,25 @@ def _run_pair_scan(symbol: str) -> list[dict]:
         if signal.get("signal") in ("Long", "Short"):
             from pipeline.signal_store import save_pending_signal, update_signal
             from agents.job3_executor import compute_order_preview
+
+            # Compute preview before debate so judge can see entry/SL/TP
             preview = compute_order_preview(signal, symbol=symbol)
             if preview:
                 signal["_order_preview"] = preview
+
+            # Run ensemble debate (mutates signal in-place)
+            if config.USE_MULTI_AGENT_DEBATE:
+                try:
+                    from analysis.ensemble_agent import run_ensemble_debate
+                    run_ensemble_debate(context, signal, symbol=symbol)
+                    # Recompute preview if judge adjusted SL/TP
+                    if signal.get("sl") or signal.get("tp"):
+                        updated_preview = compute_order_preview(signal, symbol=symbol)
+                        if updated_preview:
+                            signal["_order_preview"] = updated_preview
+                except Exception as e:
+                    logger.error(f"[{symbol}] Ensemble debate failed: {e}", exc_info=True)
+
             signal_id = save_pending_signal(signal, source="job1")
             signal["_signal_id"] = signal_id
             signal["_source"] = "job1"

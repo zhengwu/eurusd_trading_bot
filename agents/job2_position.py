@@ -49,13 +49,16 @@ def _get_client() -> anthropic.Anthropic:
 
 # ── prompts ───────────────────────────────────────────────────────────────────
 
-_SYSTEM = (
-    "You are a professional EUR/USD forex risk manager. "
-    "Your job is to protect open positions, not to predict new trades."
-)
+def _get_system(symbol: str) -> str:
+    display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
+    return (
+        f"You are a professional {display} forex risk manager. "
+        "Your job is to protect open positions, not to predict new trades."
+    )
+
 
 _PROMPT_TEMPLATE = """\
-You are monitoring an open EUR/USD position. Review the position details,
+You are monitoring an open {display} position. Review the position details,
 account health, and current market context. Recommend whether to hold, trim,
 or exit the position to protect capital.
 
@@ -96,7 +99,8 @@ def _fmt_position(pos: dict) -> str:
     direction = pos.get("type", "").upper()
     open_price = pos.get("open_price", 0)
     current_price = pos.get("current_price", 0)
-    pip = 0.0001
+    symbol = pos.get("symbol", config.MT5_SYMBOL)
+    pip = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
     pips_move = (current_price - open_price) / pip if direction == "BUY" else (open_price - current_price) / pip
     profit_str = f"${pos.get('profit', 0):.2f} ({pips_move:+.1f} pips)"
     open_est = to_est(datetime.fromisoformat(pos["open_time"])).strftime("%Y-%m-%d %H:%M EST") if pos.get("open_time") else "N/A"
@@ -132,15 +136,17 @@ def _fmt_account(acct: dict) -> str:
     return lines
 
 
-def _fmt_market_snapshot(tick: dict | None) -> str:
+def _fmt_market_snapshot(tick: dict | None, symbol: str | None = None) -> str:
     if tick is None:
         return "  (tick unavailable)"
+    sym = symbol or config.MT5_SYMBOL
+    pip = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["pip"]
     now_est = to_est(datetime.now(timezone.utc)).strftime("%H:%M EST")
     return (
         f"  Time  : {now_est}\n"
         f"  Bid   : {tick.get('bid')}\n"
         f"  Ask   : {tick.get('ask')}\n"
-        f"  Spread: {round(tick.get('spread', 0) / 0.0001, 1)} pips"
+        f"  Spread: {round(tick.get('spread', 0) / pip, 1)} pips"
     )
 
 
@@ -148,12 +154,14 @@ def _fmt_market_snapshot(tick: dict | None) -> str:
 
 def analyze_position(pos: dict) -> dict[str, Any] | None:
     """Run Claude Sonnet analysis on a single open position."""
+    symbol = pos.get("symbol", config.MT5_SYMBOL)
+    display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
     account = get_account_summary()
-    tick = get_current_tick()
+    tick = get_current_tick(symbol=symbol)
 
     # Build a lightweight market context (today's intraday + recent prices only)
     try:
-        market_context = build_context(trigger_item=None)
+        market_context = build_context(trigger_item=None, symbol=symbol)
         # Keep context short for position monitor — first 2000 chars is enough
         market_context = market_context[:2000]
     except Exception as e:
@@ -161,9 +169,10 @@ def analyze_position(pos: dict) -> dict[str, Any] | None:
         market_context = "(market context unavailable)"
 
     prompt = _PROMPT_TEMPLATE.format(
+        display=display,
         position_details=_fmt_position(pos),
         account_details=_fmt_account(account),
-        market_snapshot=_fmt_market_snapshot(tick),
+        market_snapshot=_fmt_market_snapshot(tick, symbol=symbol),
         market_context=market_context,
     )
 
@@ -171,7 +180,7 @@ def analyze_position(pos: dict) -> dict[str, Any] | None:
         message = _get_client().messages.create(
             model=config.ANALYSIS_MODEL,
             max_tokens=512,
-            system=_SYSTEM,
+            system=_get_system(symbol),
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
@@ -211,6 +220,7 @@ def _build_signal_from_recommendation(pos: dict, rec: dict) -> dict[str, Any]:
         "invalidation": "",
         "risk_note": rec.get("risk_note", ""),
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "_symbol": pos.get("symbol", config.MT5_SYMBOL),
         "_ticket": pos.get("ticket"),
         "_source": "job2",
     }
@@ -244,9 +254,12 @@ def run_position_check() -> int:
         logger.warning("MT5 not connected — skipping position check")
         return 0
 
-    positions = get_open_positions(symbol=config.MT5_SYMBOL)
+    # Check all active pairs
+    positions = []
+    for sym in config.ACTIVE_PAIRS:
+        positions.extend(get_open_positions(symbol=sym))
     if not positions:
-        logger.info("No open EURUSD positions")
+        logger.info(f"No open positions for {config.ACTIVE_PAIRS}")
         return 0
 
     logger.info(f"=== Job 2 checking {len(positions)} position(s) ===")
