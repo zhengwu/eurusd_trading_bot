@@ -6,9 +6,25 @@ TRIAGE_SCORE_THRESHOLD = 6       # Score >= this triggers full analysis
 COOLDOWN_MINUTES = 45            # Minutes to suppress re-trigger after escalation
 SCAN_INTERVAL_MINUTES = 30       # How often Tier 1 runs
 
+# ── Pre-event agent ────────────────────────────────────────────────────────────
+# Brief window: send scenario brief when event is between these many minutes away.
+# Width must exceed SCAN_INTERVAL_MINUTES to guarantee detection despite scan jitter.
+PRE_EVENT_BRIEF_MIN = 30         # Lower bound — don't send if event is < 30 min away
+PRE_EVENT_BRIEF_MAX = 90         # Upper bound — don't send if event is > 90 min away
+# Minimum surprise magnitude to trigger post-event full analysis.
+# Filters out noise (trivial beats/misses well within rounding error).
+PRE_EVENT_MIN_SURPRISE: dict[str, float] = {
+    "NFP":       20_000,   # Nonfarm Payrolls — 20K jobs
+    "CPI":       0.1,      # CPI / inflation — 0.1 percentage point
+    "GDP":       0.1,      # GDP growth — 0.1 pp
+    "RATE":      0.05,     # Rate decisions — 5 bps
+    "DEFAULT":   0.05,     # Catch-all for everything else
+}
+
 # ── Models ────────────────────────────────────────────────────────────────────
-TRIAGE_MODEL   = "claude-haiku-4-5-20251001"
-ANALYSIS_MODEL = "claude-sonnet-4-6"
+TRIAGE_MODEL          = "claude-haiku-4-5-20251001"  # Fallback only — active triage uses Azure GPT-5.2 (see triage_prompt.py)
+PRE_EVENT_BRIEF_MODEL = "claude-sonnet-4-6"          # Pre-event scenario brief — user-facing, quality matters
+ANALYSIS_MODEL        = "claude-sonnet-4-6"
 
 # Debate persona model — runs 3 concurrent calls, so cost/latency matters.
 # Haiku is fast and cheap; upgrade to Sonnet or Opus for higher-quality arguments.
@@ -87,6 +103,11 @@ DATA_DIR = Path(__file__).parent / "data"
 # ── News fetch ────────────────────────────────────────────────────────────────
 NEWS_WINDOW_DAYS = 1             # How many days back to fetch headlines
 NEWS_PER_PROVIDER_MAX_ITEMS = 20 # Max items per provider per scan
+NEWS_MAX_AGE_HOURS = 8           # Drop articles older than this (reduces stale signal noise)
+
+# ── Fast news watcher ─────────────────────────────────────────────────────────
+FAST_WATCH_INTERVAL_MINUTES = 2  # How often fast watcher polls RSS feeds
+FAST_COOLDOWN_MINUTES = 20       # Cooldown between fast-watcher escalations (shorter than main)
 
 # ── MT5 ───────────────────────────────────────────────────────────────────────
 MT5_TIMEFRAME = "M15"

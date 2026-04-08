@@ -57,6 +57,8 @@ _HELP_TEXT = (
     "> `reject <ID>` — reject a pending signal\n"
     "> `debate positions` — run Hold/Trim/Exit ensemble debate on all open positions\n"
     "> `debate positions GBPUSD` — debate a specific pair's open position(s)\n"
+    "> `close positions` — create Exit signals for all open positions (requires `approve <ID>` per position)\n"
+    "> `close positions GBPUSD` — close a specific pair's open position(s)\n"
     "> `journal` — show the 10 most recent trade journal entries\n"
     "> `journal report` — performance summary (win rate, pips, P&L)\n"
     "> `journal validate` — force validation of pending journal records against MT5\n"
@@ -563,6 +565,58 @@ def _do_debate_positions(say: Callable, symbol: str | None = None) -> None:
         )
 
 
+def _do_close_positions(say: Callable, symbol: str | None = None) -> None:
+    """Create Exit signals for all open positions (or one symbol) without running the debate."""
+    from mt5.connector import is_connected
+    from mt5.position_reader import get_open_positions
+
+    if not is_connected():
+        say(":x: MT5 is not connected — cannot read positions.")
+        return
+
+    positions = get_open_positions(symbol=symbol)
+    if not positions:
+        target = f"*{symbol}*" if symbol else "any active pair"
+        say(f":white_check_mark: No open positions for {target}.")
+        return
+
+    from pipeline.signal_store import save_pending_signal
+
+    lines = [f":scissors: Creating Exit signals for *{len(positions)}* open position(s)…\n"]
+    for pos in positions:
+        sym      = pos.get("symbol", config.MT5_SYMBOL)
+        display  = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["display"]
+        ticket   = pos.get("ticket")
+        direction = pos.get("type", "buy").upper()
+        volume   = pos.get("volume", 0)
+        open_p   = pos.get("open_price", 0)
+        curr_p   = pos.get("current_price", 0)
+        profit   = pos.get("profit", 0)
+        pip      = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["pip"]
+        decimals = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["price_decimals"]
+        pips_pnl = round(
+            (curr_p - open_p) / pip if direction == "BUY" else (open_p - curr_p) / pip,
+            1,
+        )
+
+        exit_signal = {
+            "signal":   "Exit",
+            "_ticket":  ticket,
+            "_symbol":  sym,
+            "source":   "manual_close",
+        }
+        signal_id = save_pending_signal(exit_signal, source="manual_close")
+
+        pnl_str = f"{pips_pnl:+.1f} pips  (${profit:.2f})"
+        lines.append(
+            f">*{display}* #{ticket}  {direction}  {volume} lots\n"
+            f">Open `{open_p:.{decimals}f}`  Now `{curr_p:.{decimals}f}`  P&L: {pnl_str}\n"
+            f">Signal `{signal_id}` pending — `approve {signal_id}` to close, `reject {signal_id}` to cancel"
+        )
+
+    say("\n".join(lines))
+
+
 def _do_introduce(say: Callable) -> None:
     say(
         f"*Hi! I'm your Forex Multi-Pair AI Trading Agent.* :robot_face:\n\n"
@@ -600,6 +654,7 @@ Possible intents:
 - "approve"          — user wants to approve a signal (extract signal_id if present)
 - "reject"           — user wants to reject a signal (extract signal_id if present)
 - "debate_positions" — user wants to debate / review / analyse whether to hold, trim, or exit open positions
+- "close_positions"  — user wants to close / exit / flatten all open positions directly (no debate)
 - "journal"          — user wants to see the trade journal, performance report, or past signal outcomes
 - "introduce"        — user wants to know what the bot does, or is greeting it
 - "help"             — user wants a list of commands
@@ -700,6 +755,9 @@ def _dispatch(text: str, say: Callable) -> bool:
     elif m := re.fullmatch(r"debate\s+(?:my\s+)?positions?(?:\s+(\w+))?", clean):
         pair = _extract_pair(m.group(1) or "")
         _run_in_thread(say, _do_debate_positions, pair)
+    elif m := re.fullmatch(r"close\s+(?:my\s+|all\s+)?positions?(?:\s+(\w+))?", clean):
+        pair = _extract_pair(m.group(1) or "")
+        _run_in_thread(say, _do_close_positions, pair)
     elif clean in ("journal", "journal list"):
         _run_in_thread(say, _do_journal)
     elif re.fullmatch(r"journal\s+report(?:\s+\d+)?", clean):
@@ -733,6 +791,8 @@ def _dispatch(text: str, say: Callable) -> bool:
             _run_in_thread(say, _do_approve, signal_id.upper(), None)  # NLP path: no pct
         elif intent == "debate_positions":
             _run_in_thread(say, _do_debate_positions, pair)
+        elif intent == "close_positions":
+            _run_in_thread(say, _do_close_positions, pair)
         elif intent == "journal":
             _run_in_thread(say, _do_journal)
         elif intent == "reject" and signal_id:

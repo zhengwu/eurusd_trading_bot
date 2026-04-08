@@ -155,12 +155,28 @@ def _fmt_price_table_row(date_str: str, prices: dict) -> str:
     )
 
 
+def _filter_intraday_by_symbol(records: list[dict], symbol: str) -> list[dict]:
+    """
+    Return records relevant to the given symbol.
+    Records saved before the symbol field was added (legacy) are included for all pairs.
+    Records with a non-matching symbol are excluded.
+    """
+    out = []
+    for r in records:
+        rec_sym = r.get("symbol", "")
+        # Include if: no symbol stored (legacy record) OR symbol matches
+        if not rec_sym or rec_sym == symbol:
+            out.append(r)
+    return out
+
+
 def build_context(trigger_item: dict | None = None, symbol: str | None = None) -> str:
     """
     Assemble the full context window string passed to the analysis LLM.
     Trims oldest price rows if total exceeds CONTEXT_MAX_TOKENS.
     """
     today = today_str_utc()
+    sym = symbol or config.MT5_SYMBOL
     data_dir = config.DATA_DIR
     sections: list[str] = []
 
@@ -171,19 +187,21 @@ def build_context(trigger_item: dict | None = None, symbol: str | None = None) -
         score = trigger_item.get("score") or trigger_item.get("triage_score", "?")
         tag = trigger_item.get("tag") or trigger_item.get("triage_tag", "other")
 
-        # Corroborating headlines: last few intraday items (excluding the trigger)
+        # Corroborating headlines: last few intraday items for this pair
         from triage.intraday_logger import read_today_intraday
-        recent = read_today_intraday()
+        recent = _filter_intraday_by_symbol(read_today_intraday(), sym)
         corroborating = [
             r.get("headline", "")
             for r in recent[-10:]
             if r.get("headline") and r.get("headline") != headline
         ]
 
+        pre_event_ctx = trigger_item.get("_pre_event_context", "")
         sections.append(
             f"=== BREAKING EVENT [{now_str} UTC] ===\n"
             f'Trigger: "{headline}" [score: {score}, tag: {tag}]\n'
-            f"Recent corroborating headlines (last 2 hrs): "
+            + (f"\n{pre_event_ctx}\n" if pre_event_ctx else "")
+            + f"Recent corroborating headlines (last 2 hrs): "
             f"{', '.join(corroborating[:5]) or '(none)'}\n"
         )
 
@@ -192,7 +210,6 @@ def build_context(trigger_item: dict | None = None, symbol: str | None = None) -
         try:
             from pipeline.price_agent import get_regime_inputs
             from pipeline.regime_agent import get_market_regimes
-            sym = symbol or config.MT5_SYMBOL
             inputs = get_regime_inputs(symbol=sym)
 
             # Auto-derive macro bias from yield spread; fall back to config if unavailable
@@ -219,6 +236,11 @@ def build_context(trigger_item: dict | None = None, symbol: str | None = None) -
     # ── TODAY ─────────────────────────────────────────────────────────────────
     today_dir = data_dir / today
     intraday = _read_jsonl(today_dir / "intraday.jsonl")
+    # Filter to headlines scored for this pair (legacy records without a symbol field are kept).
+    intraday = _filter_intraday_by_symbol(intraday, sym)
+    # Cap to the 30 most-recent headlines — prevents this section inflating the
+    # context and triggering truncation of the TA / price summary section later.
+    intraday = intraday[-30:] if len(intraday) > 30 else intraday
     events = _read_json(today_dir / "events.json") or []
     prices_today = _read_json(today_dir / "prices.json") or {}
 
@@ -253,7 +275,7 @@ def build_context(trigger_item: dict | None = None, symbol: str | None = None) -
     # ── PRICE SUMMARY (live + technicals + correlated assets) ────────────────
     try:
         from pipeline.price_agent import get_price_summary
-        price_summary = get_price_summary(symbol=symbol or config.MT5_SYMBOL)
+        price_summary = get_price_summary(symbol=sym)
     except Exception as e:
         logger.warning(f"Price agent failed — falling back to raw table: {e}")
         price_summary = _fallback_price_table(data_dir)

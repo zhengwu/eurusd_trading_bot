@@ -1,4 +1,4 @@
-"""News fetcher — wraps three providers: NewsAPI, Alpha Vantage, EODHD.
+"""News fetcher — wraps four providers: NewsAPI, Alpha Vantage, EODHD, Yahoo Finance.
 
 Ported and refactored from the existing news_fetching.py.
 Output is a list of normalized dicts ready for DedupCache + triage.
@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -364,6 +366,349 @@ def fetch_eodhd(start: date, end: date, max_items: int, symbol: str = "EURUSD") 
     return out
 
 
+# ── FMP (Financial Modeling Prep) ────────────────────────────────────────────
+
+def fetch_fmp(start: date, end: date, max_items: int, symbol: str = "EURUSD") -> list[dict[str, Any]]:
+    """
+    Fetch forex news from FMP /stable/news/forex-latest.
+    FMP indexes news with low latency (~5 min) vs hours for NewsAPI/EODHD.
+    Paginates via 'page' param until we have enough items or exhaust results.
+    """
+    key = os.getenv("FMP_API_KEY")
+    if not key:
+        logger.warning("FMP_API_KEY not set — skipping FMP")
+        return []
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    page = 0
+
+    while len(out) < max_items:
+        params = {
+            "page": page,
+            "limit": min(max_items * 2, 50),
+            "apikey": key,
+        }
+        try:
+            resp = requests.get(
+                "https://financialmodelingprep.com/stable/news/forex-latest",
+                params=params,
+                headers=_HEADERS,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"FMP fetch failed (page {page}): {e}")
+            break
+
+        if not isinstance(data, list) or not data:
+            break
+
+        added = 0
+        for a in data:
+            title = (a.get("title") or "").strip()
+            url = (a.get("url") or "").strip()
+            if not title or not url or url in seen:
+                continue
+            dt = _parse_dt(a.get("publishedDate") or "")
+            if not _in_range(dt, start, end):
+                continue
+            seen.add(url)
+            host = _hostname(url)
+            src_site = a.get("site") or host or "FMP"
+            out.append({
+                "source": f"FMP:{src_site}",
+                "title": title,
+                "url": url,
+                "published_dt": dt,
+                "snippet": (a.get("text") or "")[:600],
+            })
+            added += 1
+            if len(out) >= max_items:
+                break
+
+        # If this page returned nothing new, stop paginating
+        if added == 0:
+            break
+        page += 1
+
+    return out
+
+
+# ── Finnhub ───────────────────────────────────────────────────────────────────
+
+# Track last seen article ID per symbol so we only fetch new articles each poll
+_finnhub_last_id: dict[str, int] = {}
+
+
+def fetch_finnhub(start: date, end: date, max_items: int, symbol: str = "EURUSD") -> list[dict[str, Any]]:
+    """
+    Fetch forex news from Finnhub GET /news?category=forex.
+    Uses minId pagination to only retrieve articles newer than the last fetch.
+    No webhook required — REST polling is sufficient for news.
+    Free tier supports 60 calls/min.
+    """
+    key = os.getenv("FINNHUB_API_KEY")
+    if not key:
+        logger.warning("FINNHUB_API_KEY not set — skipping Finnhub")
+        return []
+
+    params: dict[str, Any] = {
+        "category": "forex",
+        "token": key,
+    }
+    min_id = _finnhub_last_id.get(symbol, 0)
+    if min_id:
+        params["minId"] = min_id
+
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/news",
+            params=params,
+            headers=_HEADERS,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f"Finnhub fetch failed: {e}")
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    start_ts = datetime(start.year, start.month, start.day, tzinfo=timezone.utc).timestamp()
+    end_ts   = datetime(end.year, end.month, end.day, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+
+    out: list[dict[str, Any]] = []
+    max_id_seen = min_id
+
+    for a in data:
+        title = (a.get("headline") or "").strip()
+        url = (a.get("url") or "").strip()
+        if not title or not url:
+            continue
+
+        pub_ts = a.get("datetime")
+        if pub_ts:
+            dt = datetime.fromtimestamp(float(pub_ts), tz=timezone.utc)
+            if dt.timestamp() < start_ts or dt.timestamp() > end_ts:
+                continue
+        else:
+            dt = None
+
+        article_id = a.get("id") or 0
+        if article_id > max_id_seen:
+            max_id_seen = article_id
+
+        out.append({
+            "source": f"Finnhub:{a.get('source') or 'finnhub'}",
+            "title": title,
+            "url": url,
+            "published_dt": dt,
+            "snippet": (a.get("summary") or "")[:600],
+        })
+        if len(out) >= max_items:
+            break
+
+    # Advance the cursor so next poll only fetches newer articles
+    if max_id_seen > min_id:
+        _finnhub_last_id[symbol] = max_id_seen
+
+    return out
+
+
+# ── RSS (ForexLive + FXStreet) ────────────────────────────────────────────────
+#
+# No API key required. Both feeds update within 2–5 minutes of publication.
+# ForexLive is especially valuable for breaking macro/geopolitical headlines.
+
+_RSS_FEEDS = [
+    ("https://www.forexlive.com/feed/news",  "ForexLive"),
+    ("https://www.fxstreet.com/rss/news",    "FXStreet"),
+]
+
+# Per-pair keyword filter — avoid RSS flooding the log with irrelevant cross-pair TA
+_RSS_PAIR_KEYWORDS: dict[str, list[str]] = {
+    "EURUSD": [
+        r"\bEUR\b", r"\beuro\b", r"\bECB\b", r"\beuropean central bank\b",
+        r"\bEurozone\b", r"\bGermany\b", r"\bFrance\b",
+        r"\bUSD\b", r"\bdollar\b", r"\bFed\b", r"\bfederal reserve\b",
+        r"\binflation\b", r"\bCPI\b", r"\bGDP\b", r"\bNFP\b", r"\btariff",
+        r"\bgeopolit", r"\brisk.off\b", r"\brisk.on\b",
+    ],
+    "GBPUSD": [
+        r"\bGBP\b", r"\bpound\b", r"\bsterling\b", r"\bBOE\b", r"\bbank of england\b",
+        r"\bUK\b", r"\bBritish\b", r"\bBrexit\b",
+        r"\bUSD\b", r"\bdollar\b", r"\bFed\b", r"\bfederal reserve\b",
+        r"\binflation\b", r"\bCPI\b", r"\bGDP\b", r"\btariff",
+        r"\bgeopolit", r"\brisk.off\b", r"\brisk.on\b",
+    ],
+    "USDJPY": [
+        r"\bJPY\b", r"\byen\b", r"\bBOJ\b", r"\bbank of japan\b",
+        r"\bJapan\b", r"\bJapanese\b", r"\bNikkei\b", r"\bYCC\b",
+        r"\bUSD\b", r"\bdollar\b", r"\bFed\b", r"\bfederal reserve\b",
+        r"\bsafe.haven\b", r"\brisk.off\b", r"\brisk.on\b",
+        r"\binflation\b", r"\bCPI\b", r"\btariff",
+    ],
+    "AUDUSD": [
+        r"\bAUD\b", r"\baussie\b", r"\bRBA\b", r"\bReserve Bank of Australia\b",
+        r"\bAustrali", r"\bChina\b", r"\biron ore\b", r"\bcommodit",
+        r"\bUSD\b", r"\bdollar\b", r"\bFed\b", r"\bfederal reserve\b",
+        r"\binflation\b", r"\bCPI\b", r"\btariff",
+    ],
+}
+
+
+def fetch_rss(start: date, end: date, max_items: int, symbol: str = "EURUSD") -> list[dict[str, Any]]:
+    """
+    Fetch recent forex news from ForexLive and FXStreet RSS feeds.
+    No API key required. Latency ~2-5 minutes from publication.
+    Filters articles by pair-relevant keywords to avoid irrelevant cross-pair TA noise.
+    """
+    patterns = _RSS_PAIR_KEYWORDS.get(symbol, _RSS_PAIR_KEYWORDS["EURUSD"])
+    start_ts = datetime(start.year, start.month, start.day, tzinfo=timezone.utc).timestamp()
+    end_ts   = datetime(end.year, end.month, end.day, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for feed_url, feed_name in _RSS_FEEDS:
+        if len(out) >= max_items:
+            break
+        try:
+            resp = requests.get(feed_url, headers=_HEADERS, timeout=15)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.text)
+            channel = root.find("channel")
+            if channel is None:
+                continue
+            items = channel.findall("item")
+        except Exception as e:
+            logger.warning(f"RSS fetch failed [{feed_name}]: {e}")
+            continue
+
+        for item in items:
+            if len(out) >= max_items:
+                break
+
+            title = (item.findtext("title") or "").strip()
+            url   = (item.findtext("link")  or "").strip()
+            if not title or not url or url in seen:
+                continue
+
+            pubdate_str = item.findtext("pubDate") or ""
+            dt: Optional[datetime] = None
+            if pubdate_str:
+                try:
+                    dt = parsedate_to_datetime(pubdate_str).astimezone(timezone.utc)
+                except Exception:
+                    pass
+
+            if dt and (dt.timestamp() < start_ts or dt.timestamp() > end_ts):
+                continue
+
+            # Keyword filter — skip articles with no pair-relevant terms
+            text = title.lower()
+            desc = (item.findtext("description") or "").lower()
+            combined = text + " " + desc
+            if not any(re.search(p, combined, re.IGNORECASE) for p in patterns):
+                continue
+
+            seen.add(url)
+            snippet = (item.findtext("description") or "").strip()
+            out.append({
+                "source": f"RSS:{feed_name}",
+                "title": title,
+                "url": url,
+                "published_dt": dt,
+                "snippet": snippet[:600],
+            })
+
+    logger.debug(f"RSS [{symbol}]: {len(out)} items from {[f[1] for f in _RSS_FEEDS]}")
+    return out
+
+
+# ── Yahoo Finance ─────────────────────────────────────────────────────────────
+#
+# Uses the yfinance Ticker.news property — already a project dependency (price_agent.py).
+# No API key required. Fetches from multiple tickers per pair to maximise coverage:
+# the pair ticker itself plus correlated assets (DXY, Gold, etc.) that drive the pair.
+
+# Per-pair tickers to pull Yahoo Finance news from
+_YF_NEWS_TICKERS: dict[str, list[str]] = {
+    "EURUSD": ["EURUSD=X", "DX-Y.NYB", "^TNX", "GC=F"],
+    "GBPUSD": ["GBPUSD=X", "DX-Y.NYB", "^TNX"],
+    "USDJPY": ["USDJPY=X", "DX-Y.NYB", "^TNX", "^N225"],
+    "AUDUSD": ["AUDUSD=X", "DX-Y.NYB", "GC=F"],
+}
+
+
+def fetch_yahoo_finance(start: date, end: date, max_items: int, symbol: str = "EURUSD") -> list[dict[str, Any]]:
+    """
+    Fetch recent news from Yahoo Finance via yfinance (no API key required).
+    Pulls from the pair ticker and its key correlated tickers, then deduplicates by URL.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.warning("yfinance not installed — skipping Yahoo Finance news")
+        return []
+
+    tickers = _YF_NEWS_TICKERS.get(symbol, _YF_NEWS_TICKERS["EURUSD"])
+    start_ts = datetime(start.year, start.month, start.day, tzinfo=timezone.utc).timestamp()
+    end_ts   = datetime(end.year,   end.month,   end.day,   23, 59, 59, tzinfo=timezone.utc).timestamp()
+
+    seen_urls: set[str] = set()
+    out: list[dict[str, Any]] = []
+
+    for ticker_sym in tickers:
+        if len(out) >= max_items:
+            break
+        try:
+            ticker = yf.Ticker(ticker_sym)
+            raw_news = ticker.news or []
+        except Exception as e:
+            logger.debug(f"Yahoo Finance {ticker_sym}: {e}")
+            continue
+
+        for item in raw_news:
+            if len(out) >= max_items:
+                break
+
+            # yfinance news schema: title, link, publisher, providerPublishTime (unix ts), type
+            content_type = item.get("type", "")
+            if content_type and content_type.upper() not in ("STORY", ""):
+                continue  # skip VIDEO, THUMBNAIL-only items
+
+            title = (item.get("title") or "").strip()
+            url   = (item.get("link")  or "").strip()
+            if not title or not url or url in seen_urls:
+                continue
+
+            pub_ts = item.get("providerPublishTime")
+            if pub_ts:
+                dt = datetime.fromtimestamp(float(pub_ts), tz=timezone.utc)
+                if dt.timestamp() < start_ts or dt.timestamp() > end_ts:
+                    continue
+            else:
+                dt = None
+
+            publisher = item.get("publisher") or ticker_sym
+            seen_urls.add(url)
+            out.append({
+                "source": f"YahooFinance:{publisher}",
+                "title": title,
+                "url": url,
+                "published_dt": dt,
+                "snippet": "",   # Yahoo Finance doesn't return body text in this endpoint
+            })
+
+    logger.debug(f"Yahoo Finance [{symbol}]: {len(out)} items from {tickers}")
+    return out
+
+
 # ── combined fetcher ──────────────────────────────────────────────────────────
 
 def fetch_news(
@@ -383,13 +728,28 @@ def fetch_news(
     start = today - timedelta(days=days_back)
 
     all_items: list[dict[str, Any]] = []
-    for fetch_fn in [fetch_newsapi, fetch_alphavantage, fetch_eodhd]:
+    # Low-latency sources first — they win dedup when same article appears in multiple providers
+    # Order: RSS (~2-5 min) → FMP (~5 min) → Finnhub (~5 min) → slower batch APIs
+    for fetch_fn in [fetch_rss, fetch_fmp, fetch_finnhub, fetch_newsapi, fetch_alphavantage, fetch_eodhd, fetch_yahoo_finance]:
         try:
             items = fetch_fn(start, today, max_per_provider, sym)
             all_items.extend(items)
             logger.debug(f"{fetch_fn.__name__} [{sym}]: {len(items)} items")
         except Exception as e:
             logger.error(f"{fetch_fn.__name__} failed: {e}")
+
+    # Drop articles older than NEWS_MAX_AGE_HOURS to filter stale delayed articles
+    max_age_hours = getattr(config, "NEWS_MAX_AGE_HOURS", None)
+    if max_age_hours:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        before = len(all_items)
+        all_items = [
+            item for item in all_items
+            if item.get("published_dt") is None or item["published_dt"] >= cutoff
+        ]
+        dropped = before - len(all_items)
+        if dropped:
+            logger.debug(f"Dropped {dropped} articles older than {max_age_hours}h")
 
     # Deduplicate by URL within this combined batch
     seen: set[str] = set()

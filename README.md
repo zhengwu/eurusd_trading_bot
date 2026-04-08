@@ -33,7 +33,7 @@ Adding or removing pairs requires one line change in `config.py`.
 
 A Python-based AI agent that runs 24/5 (while the forex market is open) and does three things automatically:
 
-1. **Reads the news.** Every 30 minutes it scans financial news for each active pair independently, scores headlines 1–10 for relevance to that specific pair, and — when something important is detected — runs a deep analysis using Claude Sonnet to generate a trading signal (Long, Short, or Wait). Each pair has its own news queries, cooldown timer, and deduplication cache so they never interfere with each other.
+1. **Reads the news.** A fast news watcher polls RSS feeds every 2 minutes for breaking headlines; the main scanner runs every 30 minutes across all providers. Headlines are scored 1–10 using a two-pass triage system (Azure GPT-5.2 for both passes, Claude Haiku fallback), and — when something important is detected — runs a deep analysis using Claude Sonnet to generate a trading signal (Long, Short, or Wait). Each pair has its own news queries, cooldown timer, and deduplication cache so they never interfere with each other.
 
 2. **Watches your open positions.** Every 30 minutes it reads all open MT5 positions across all active pairs and uses Claude Sonnet to recommend whether to Hold, Trim, or Exit each one based on current market conditions.
 
@@ -56,22 +56,35 @@ Claude Sonnet sees this regime summary alongside the news and price data, and is
 
 **Automatic central bank policy tracking.** Whenever the news scanner detects a central bank headline (Fed, ECB, BOE, or BOJ — any speech, press conference, or rate decision), the agent automatically fetches the latest official statement from the bank's website, uses Claude Haiku to extract the current stance and forward guidance, and writes the result to `data/rate_cycles.json`. The regime engine picks up the update immediately on the next analysis run. A Slack notification is sent, with `[STANCE CHANGED]` flagged when the stance differs from the previous reading.
 
+**Low-latency news pipeline.** Headlines are sourced from seven providers in order of latency: ForexLive/FXStreet RSS (~2–5 min), FMP (~5 min), Finnhub (~5 min), then NewsAPI, AlphaVantage, EODHD, and Yahoo Finance. Articles older than 8 hours are dropped automatically. The fast watcher polls RSS every 2 minutes in a dedicated background thread, so breaking news triggers analysis in ~5 minutes rather than up to 30.
+
 ---
 
 ## How it works — the 4 jobs
 
 The system is organised into four jobs. All four start automatically when you run the agent.
 
-### Job 1 — Opportunity Scanner (runs every 30 minutes)
+### Job 1 — Opportunity Scanner
 
-Job 1 is the core loop. Every 30 minutes during market hours it:
+Job 1 runs two parallel news loops and an end-of-day collector:
+
+#### Fast news watcher (every 2 minutes)
+
+A dedicated background thread polls ForexLive and FXStreet RSS feeds every 2 minutes — the lowest-latency sources available (~2–5 minutes from publication). When a high-score article is found it immediately triggers full analysis, bypassing the 30-minute scan wait. Uses a separate short cooldown (`FAST_COOLDOWN_MINUTES`, default 20 min) so it never blocks the main scan.
+
+#### Main scanner (every 30 minutes)
+
+Every 30 minutes during market hours it:
 
 1. **Refreshes the economic calendar** — fetches today's ForexFactory events (USD, EUR, GBP, JPY) with the latest actual vs forecast data. This happens once per cycle so Claude always has up-to-date beat/miss information during the trading day.
 
 2. **Scans news for each active pair** — for EURUSD, GBPUSD, and USDJPY independently:
-   - Fetches headlines from NewsAPI (pair-specific API query), AlphaVantage (broad macro + keyword filter), and EODHD (pair-specific ticker feed)
-   - Filters new articles through a per-pair deduplication cache
-   - Sends headlines to Claude Haiku for fast triage scoring (1–10) and tagging in the context of that specific pair
+   - Fetches headlines from FMP (forex news API), Finnhub (forex news with `minId` cursor), ForexLive/FXStreet RSS, NewsAPI, AlphaVantage, and EODHD — in order of latency (fastest first)
+   - Drops articles older than `NEWS_MAX_AGE_HOURS` (default 8h) to filter stale delayed articles
+   - Filters new articles through a per-pair deduplication cache (shared with the fast watcher)
+   - Sends headlines through a two-pass triage system:
+     - **Pass 1** — Azure GPT-5.2 scores all headlines 1–10 with calibrated examples (fallback: Claude Haiku)
+     - **Pass 2** — Azure GPT-5.2 re-evaluates borderline scores (4–6), pushing them decisively up or down to reduce clustering around 5 (fallback: Claude Haiku)
    - Tags include `cb_decision`, `CB_speech`, `macro_data`, `geopolitical`, `risk_off`, `risk_on`, `other`. CB headlines also carry a `cb_bank` field (`Fed`, `ECB`, `BOE`, or `BOJ`)
 
 3. **Triggers CB policy update** — any headline tagged `cb_decision` or `CB_speech` launches a background fetch of that bank's latest official statement and a Haiku-powered extraction of the current stance and guidance. Updates `data/rate_cycles.json` automatically, with per-bank per-day deduplication to avoid redundant fetches.
@@ -310,7 +323,10 @@ The delta between suggested and actual is stored side by side in the CSV, making
 
 | Service | Used for | Free tier? |
 |---|---|---|
-| Anthropic | Claude Haiku (triage + CB policy extraction) + Claude Sonnet (analysis, positions, chat) | No — pay per token |
+| Anthropic | Claude Haiku (CB policy extraction, triage fallback) + Claude Sonnet (analysis, positions, chat) | No — pay per token |
+| Azure OpenAI | GPT-5.2 — two-pass triage scoring (both passes) | Workplace/institutional access |
+| FMP | Low-latency forex news (~5 min) | Paid |
+| Finnhub | Low-latency forex news (~5 min) | Yes (free tier) |
 | NewsAPI | Financial news headlines per pair | Yes (100 req/day) |
 | AlphaVantage | Financial news + sentiment | Yes (25 req/day) |
 | EODHD | Pair-specific news feed | Yes (limited) |
@@ -362,6 +378,18 @@ Create a file named `.env` in the `eurusd_agent` folder (filename starts with a 
 ```
 # Anthropic — https://console.anthropic.com/
 ANTHROPIC_API_KEY=sk-ant-...
+
+# Azure OpenAI — triage scoring (both passes), free via workplace
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_API_VERSION=2025-04-01-preview
+AZURE_OPENAI_DEPLOYMENT=gpt-5.2
+AZURE_OPENAI_API_KEY=...
+
+# FMP — https://financialmodelingprep.com/ (low-latency forex news)
+FMP_API_KEY=...
+
+# Finnhub — https://finnhub.io/ (low-latency forex news, free tier)
+FINNHUB_API_KEY=...
 
 # NewsAPI — https://newsapi.org/register
 NEWS_API_KEY=...
@@ -451,16 +479,18 @@ Startup output:
 ============================================================
 Forex Multi-Pair Agent — Job 1
   Active pairs  : ['EURUSD', 'GBPUSD', 'USDJPY']
-  Triage model  : claude-haiku-4-5-20251001
+  Triage model  : Azure gpt-5.2 (Haiku fallback)
   Analysis model: claude-sonnet-4-6
   Scan interval : 30 min
-  Market hours  : 7:00 – 21:00 UTC
+  Fast watch    : 2 min (RSS)
+  Market hours  : 7:00 – 23:00 UTC
   Daily collect : 22:00 UTC
   Job 2 interval: 30 min
   Notifications : ['print', 'slack']
 ============================================================
 Daily collection scheduler running in background
 Job 2 position monitor starting in background
+Fast news watcher starting in background (interval: 2 min)
 Slack bot starting in background
 ```
 
@@ -492,7 +522,7 @@ Send commands as a DM to the bot, or @mention it in your alerts channel.
 
 | Command | What it does |
 |---|---|
-| `scan` | Refresh economic calendar, scan news for **all** active pairs, triage with Haiku, escalate high-score articles to Sonnet |
+| `scan` | Refresh economic calendar, scan news for **all** active pairs, triage with GPT-5.2 (two-pass), escalate high-score articles to Sonnet |
 | `scan GBPUSD` | Same but for one pair only |
 | `analyze` | Full analysis for the primary pair (EURUSD) — builds context, runs Sonnet, returns signal with order details |
 | `analyze USDJPY` | Full analysis for a specific pair |
@@ -552,7 +582,7 @@ Inside a chat session Claude has live tool access: positions, account info, news
 
 ### 09:15 UTC — Job 1 detects a high-impact event
 
-The scanner picks up: "UK CPI beats forecast at 3.2%, BOE rate cut bets fade". Claude Haiku scores it 8/10 for GBP/USD and tags it `macro_data`. Full analysis triggers.
+The fast watcher picks up: "UK CPI beats forecast at 3.2%, BOE rate cut bets fade" from FXStreet RSS (published 3 minutes ago). Azure GPT-5.2 scores it 8/10 for GBP/USD and tags it `macro_data`. Full analysis triggers immediately — no wait for the 30-minute scan cycle.
 
 Claude Sonnet builds the GBP/USD context — today's news, economic events including the UK CPI actual vs forecast, current market regime (VIX, SMA stack, ATR, macro bias showing GBP yield advantage narrowing), live M15 bars, 30-day price trend, FTSE and EURGBP correlations — and returns a Long signal.
 
@@ -653,7 +683,7 @@ eurusd_agent/
 ├── triage/
 │   ├── scanner.py             # 30-min scan loop — refreshes events, scans all pairs,
 │   │                          # triggers CB policy update on CB-tagged headlines
-│   ├── triage_prompt.py       # Claude Haiku prompt — scores, tags, identifies cb_bank
+│   ├── triage_prompt.py       # Two-pass triage: Azure GPT-5.2 (pass 1+2), Haiku fallback
 │   ├── intraday_logger.py     # Logs today's scored headlines to disk
 │   └── cooldown.py            # Per-pair cooldown: data/.cooldown_EURUSD, etc.
 │
@@ -667,7 +697,8 @@ eurusd_agent/
 ├── pipeline/
 │   ├── signal_store.py        # Pending signal queue
 │   ├── daily_collector.py     # End-of-day: prices, events, summaries (all pairs)
-│   ├── news_fetcher.py        # NewsAPI / AlphaVantage / EODHD (pair-specific queries)
+│   ├── fast_news_watcher.py   # 2-min RSS poll loop — immediate escalation on breaking news
+│   ├── news_fetcher.py        # RSS / FMP / Finnhub / NewsAPI / AlphaVantage / EODHD
 │   ├── price_fetcher.py       # yfinance closing prices
 │   ├── price_agent.py         # Live price summary: tick, M15, daily, technicals,
 │   │                          # yield spreads (ECB / BOE / MOF Japan), macro bias
@@ -698,9 +729,12 @@ eurusd_agent/
     ├── rate_cycles.json       # Auto-updated CB policy overrides (stance, guidance, expected)
     ├── trade_journal.jsonl    # Append-only trade journal source of truth
     ├── trade_journal.csv      # Trade journal as CSV — open in Excel or pandas
-    ├── .cooldown_EURUSD       # Per-pair cooldown timestamps
+    ├── .cooldown_EURUSD       # Main scanner per-pair cooldown timestamps
     ├── .cooldown_GBPUSD
     ├── .cooldown_USDJPY
+    ├── .cooldown_fast_EURUSD  # Fast watcher per-pair cooldown timestamps
+    ├── .cooldown_fast_GBPUSD
+    ├── .cooldown_fast_USDJPY
     ├── .dedup_cache_EURUSD    # Per-pair article dedup caches
     ├── .dedup_cache_GBPUSD
     ├── .dedup_cache_USDJPY
@@ -732,15 +766,18 @@ To remove a pair: remove it from `ACTIVE_PAIRS`. Everything else adapts automati
 
 | Parameter | Default | What it controls |
 |---|---|---|
-| `SCAN_INTERVAL_MINUTES` | 30 | How often Job 1 scans news |
+| `SCAN_INTERVAL_MINUTES` | 30 | How often the main scanner runs |
+| `FAST_WATCH_INTERVAL_MINUTES` | 2 | How often the fast watcher polls RSS feeds |
+| `FAST_COOLDOWN_MINUTES` | 20 | Per-pair cooldown for the fast watcher (shorter than main) |
 | `TRIAGE_SCORE_THRESHOLD` | 6 | Minimum score (1–10) to trigger full analysis |
 | `COOLDOWN_MINUTES` | 45 | Per-pair silence period after a trigger fires |
+| `NEWS_MAX_AGE_HOURS` | 8 | Drop articles older than this many hours |
 | `JOB2_CHECK_INTERVAL_MINUTES` | 30 | How often Job 2 checks open positions |
 | `JOB3_RISK_PCT` | 1.0 | Percentage of equity risked per trade |
 | `JOB3_SIGNAL_EXPIRY_MINUTES` | 60 | How long a signal stays valid before auto-expiring |
 | `MARKET_HOURS_START` / `END` | 7 / 23 | Active scanning window (UTC hour) |
 | `DAILY_COLLECTION_TIME_UTC` | `"22:00"` | When end-of-day collection runs |
-| `TRIAGE_MODEL` | `claude-haiku-4-5-20251001` | Fast model for headline scoring and CB extraction |
+| `TRIAGE_MODEL` | `claude-haiku-4-5-20251001` | Fallback triage model (active triage uses Azure GPT-5.2) |
 | `ANALYSIS_MODEL` | `claude-sonnet-4-6` | Full analysis, position monitor, chat |
 | `USE_REGIME_ANALYSIS` | `True` | Inject regime summary into the LLM context window |
 | `USE_MULTI_AGENT_DEBATE` | `True` | Run ensemble debate on every Long/Short signal |

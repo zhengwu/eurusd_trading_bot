@@ -107,9 +107,14 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("Forex Multi-Pair Agent — Job 1")
     logger.info(f"  Active pairs  : {config.ACTIVE_PAIRS}")
-    logger.info(f"  Triage model  : {config.TRIAGE_MODEL}")
+    import os
+    _azure_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+    _azure_dep = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
+    _triage_display = f"Azure {_azure_dep} (Haiku fallback)" if _azure_key else f"{config.TRIAGE_MODEL} (Haiku)"
+    logger.info(f"  Triage model  : {_triage_display}")
     logger.info(f"  Analysis model: {config.ANALYSIS_MODEL}")
     logger.info(f"  Scan interval : {config.SCAN_INTERVAL_MINUTES} min")
+    logger.info(f"  Fast watch    : {config.FAST_WATCH_INTERVAL_MINUTES} min (RSS)")
     logger.info(
         f"  Market hours  : {config.MARKET_HOURS_START}:00 – "
         f"{config.MARKET_HOURS_END}:00 UTC"
@@ -137,6 +142,19 @@ def main() -> None:
     )
     j2_thread.start()
     logger.info("Job 2 position monitor starting in background")
+
+    # Start fast news watcher (2-min RSS poll) in background thread
+    from pipeline.fast_news_watcher import run_fast_watcher_loop
+    fw_thread = threading.Thread(
+        target=run_fast_watcher_loop,
+        daemon=True,
+        name="fast-news-watcher",
+    )
+    fw_thread.start()
+    logger.info(
+        f"Fast news watcher starting in background "
+        f"(interval: {config.FAST_WATCH_INTERVAL_MINUTES} min)"
+    )
 
     # Start Slack bot in background thread (no-ops if tokens not set)
     from agents.slack_bot import run_slack_bot

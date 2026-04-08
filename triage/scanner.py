@@ -76,6 +76,14 @@ def run_scan(force: bool = False) -> list[dict]:
         # Refresh economic calendar so actuals are current for this cycle
         _refresh_events()
 
+        # Run pre-event checks (briefs + post-event triggers) for each pair
+        for symbol in config.ACTIVE_PAIRS:
+            try:
+                from pipeline.pre_event_agent import run_pre_event_check
+                run_pre_event_check(symbol)
+            except Exception as e:
+                logger.error(f"Pre-event check failed for {symbol}: {e}", exc_info=True)
+
         all_triggered = []
         for symbol in config.ACTIVE_PAIRS:
             try:

@@ -390,7 +390,7 @@ def _call_judge(
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         msg = client.messages.create(
             model=config.DEBATE_JUDGE_MODEL,
-            max_tokens=1024,
+            max_tokens=2048,
             system=_JUDGE_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -648,7 +648,7 @@ def _call_position_judge(
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         msg = client.messages.create(
             model=config.DEBATE_JUDGE_MODEL,
-            max_tokens=1024,
+            max_tokens=2048,
             system=_JUDGE_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -712,8 +712,8 @@ def run_ensemble_debate(
             )
         )
     except Exception as e:
-        logger.error(f"[{sym}] Persona generation failed: {e}")
-        return None
+        logger.error(f"[{sym}] Persona generation failed: {e}", exc_info=True)
+        raise RuntimeError(f"Persona generation failed: {e}") from e
 
     logger.info(f"[{sym}] Personas complete — running Meta-Judge")
 
@@ -727,8 +727,12 @@ def run_ensemble_debate(
         display=display,
     )
     if not debate_result:
-        logger.warning(f"[{sym}] Meta-Judge failed — skipping debate enrichment")
-        return None
+        logger.warning(f"[{sym}] Meta-Judge failed — likely JSON parse error in judge response")
+        raise RuntimeError(
+            "Meta-Judge failed to return valid JSON. "
+            "Check logs for the raw judge response. "
+            "This usually means the response was truncated or malformed."
+        )
 
     # Attach full arguments for traceability
     debate_result["_personas"] = {
@@ -839,8 +843,8 @@ def run_position_debate(
             )
         )
     except Exception as e:
-        logger.error(f"[{sym}] Position persona generation failed: {e}")
-        return None
+        logger.error(f"[{sym}] Position persona generation failed: {e}", exc_info=True)
+        raise RuntimeError(f"Persona generation failed: {e}") from e
 
     logger.info(f"[{sym}] Position personas complete — running Meta-Judge")
 
@@ -855,8 +859,12 @@ def run_position_debate(
         display=display,
     )
     if not debate_result:
-        logger.warning(f"[{sym}] Position Meta-Judge failed")
-        return None
+        logger.warning(f"[{sym}] Position Meta-Judge failed — likely JSON parse error in judge response")
+        raise RuntimeError(
+            "Meta-Judge failed to return valid JSON. "
+            "Check logs for the raw judge response. "
+            "This usually means the response was truncated or malformed."
+        )
 
     # Attach full arguments for traceability
     debate_result["_personas"] = {

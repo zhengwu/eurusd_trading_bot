@@ -110,6 +110,49 @@ def _pips(price: float, ref: float, pip: float) -> str:
     return f"{diff:+d}p"
 
 
+def _ema(closes: pd.Series, period: int) -> float | None:
+    if len(closes) < period:
+        return None
+    return round(float(closes.ewm(span=period, adjust=False).mean().iloc[-1]), 5)
+
+
+def _macd(closes: pd.Series) -> tuple[float, float, float] | None:
+    """Returns (macd_line, signal_line, histogram). Standard 12/26/9 settings."""
+    if len(closes) < 35:
+        return None
+    try:
+        ema12   = closes.ewm(span=12, adjust=False).mean()
+        ema26   = closes.ewm(span=26, adjust=False).mean()
+        line    = ema12 - ema26
+        signal  = line.ewm(span=9, adjust=False).mean()
+        hist    = line - signal
+        return (
+            round(float(line.iloc[-1]),   6),
+            round(float(signal.iloc[-1]), 6),
+            round(float(hist.iloc[-1]),   6),
+        )
+    except Exception:
+        return None
+
+
+def _bollinger(closes: pd.Series, period: int = 20, num_std: float = 2.0) -> tuple[float, float, float] | None:
+    """Returns (upper, mid, lower) for the current bar."""
+    if len(closes) < period:
+        return None
+    try:
+        mid   = closes.rolling(period).mean()
+        std   = closes.rolling(period).std()
+        upper = mid + num_std * std
+        lower = mid - num_std * std
+        return (
+            round(float(upper.iloc[-1]), 5),
+            round(float(mid.iloc[-1]),   5),
+            round(float(lower.iloc[-1]), 5),
+        )
+    except Exception:
+        return None
+
+
 # ── data fetchers ─────────────────────────────────────────────────────────────
 
 def _fetch_daily(ticker: str, period: str = "1y") -> pd.DataFrame | None:
@@ -140,6 +183,18 @@ def _m15_bars(symbol: str) -> pd.DataFrame | None:
             return None
         from mt5.position_reader import get_ohlc_bars
         return get_ohlc_bars(symbol=symbol, count=24)
+    except Exception:
+        return None
+
+
+def _h4_bars(symbol: str) -> pd.DataFrame | None:
+    """Last 100 H4 bars (~17 months) from MT5."""
+    try:
+        from mt5.connector import is_connected
+        if not is_connected():
+            return None
+        from mt5.position_reader import get_ohlc_bars
+        return get_ohlc_bars(symbol=symbol, timeframe_str="H4", count=100)
     except Exception:
         return None
 
@@ -367,6 +422,188 @@ def _section_correlated(symbol: str) -> str:
     return "\n".join(rows)
 
 
+# ── H4 / indicator / MTF helpers ─────────────────────────────────────────────
+
+def _m15_direction(bars: pd.DataFrame | None) -> str:
+    """Derive M15 bias string from bar structure."""
+    if bars is None or len(bars) < 16:
+        return "Unknown"
+    last16 = bars.tail(16)
+    highs = last16["high"].values
+    lows  = last16["low"].values
+    hh = highs[-1] > highs[:8].max()
+    hl = lows[-1]  > lows[:8].min()
+    if hh and hl:
+        return "Bullish"
+    elif (not hh) and (not hl):
+        return "Bearish"
+    up_bars = int((last16["close"] > last16["open"]).sum())
+    if up_bars > 10:
+        return "Bullish"
+    if up_bars < 6:
+        return "Bearish"
+    return "Mixed"
+
+
+def _section_h4(h4_bars: pd.DataFrame | None, pip: float, decimals: int = 5) -> tuple[str, str]:
+    """
+    Build H4 technical section.
+    Returns (formatted_text, direction) where direction is Bullish/Bearish/Mixed/Unknown.
+    """
+    if h4_bars is None or len(h4_bars) < 55:
+        return "H4 timeframe   : MT5 not connected — no H4 data", "Unknown"
+
+    fmt      = f".{decimals}f"
+    h4_close = h4_bars["close"]
+    price    = float(h4_close.iloc[-1])
+
+    rsi_h4   = _rsi(h4_close, 14)
+    atr_h4   = _atr(h4_bars.rename(columns={"open": "Open", "high": "High",
+                                             "low": "Low", "close": "Close"}), 14)
+    ema20_h4 = _ema(h4_close, 20)
+    ema50_h4 = _ema(h4_close, 50)
+
+    lines = ["H4 timeframe (last 100 bars):"]
+
+    if ema20_h4:
+        rel20 = "ABOVE ↑" if price > ema20_h4 else "BELOW ↓"
+        dist20 = _pips(price, ema20_h4, pip)
+        lines.append(f"  EMA 20 (H4)  : {ema20_h4:{fmt}}  (price {rel20}  {dist20})")
+    if ema50_h4:
+        rel50 = "ABOVE ↑" if price > ema50_h4 else "BELOW ↓"
+        dist50 = _pips(price, ema50_h4, pip)
+        lines.append(f"  EMA 50 (H4)  : {ema50_h4:{fmt}}  (price {rel50}  {dist50})")
+    if rsi_h4 is not None:
+        rsi_lbl = (
+            "Overbought ⚠" if rsi_h4 >= 70 else
+            "Oversold ⚠"  if rsi_h4 <= 30 else
+            "Bullish"      if rsi_h4 >= 55 else
+            "Bearish"      if rsi_h4 <= 45 else
+            "Neutral"
+        )
+        lines.append(f"  RSI 14 (H4)  : {rsi_h4}  — {rsi_lbl}")
+    if atr_h4 is not None:
+        lines.append(f"  ATR 14 (H4)  : {atr_h4:.5f}  (~{round(atr_h4/pip)}p avg H4 range)")
+
+    # H4 direction
+    if ema20_h4 and ema50_h4:
+        if price > ema20_h4 and ema20_h4 > ema50_h4:
+            direction = "Bullish"
+            bias_str  = f"Bullish ↑ (price > EMA20 > EMA50"
+        elif price < ema20_h4 and ema20_h4 < ema50_h4:
+            direction = "Bearish"
+            bias_str  = f"Bearish ↓ (price < EMA20 < EMA50"
+        elif price > ema50_h4:
+            direction = "Mixed"
+            bias_str  = f"Mixed (price above EMA50 but EMA20/50 crossed"
+        else:
+            direction = "Mixed"
+            bias_str  = f"Mixed (price below EMA50 but EMA20/50 crossed"
+        rsi_part = f", RSI {rsi_h4})" if rsi_h4 else ")"
+        lines.append(f"  H4 bias      : {bias_str}{rsi_part}")
+    else:
+        direction = "Unknown"
+
+    return "\n".join(lines), direction
+
+
+def _section_indicators_d1(closes: pd.Series, df: pd.DataFrame, pip: float, decimals: int = 5) -> str:
+    """D1 MACD, Bollinger Bands, and ADX section."""
+    fmt   = f".{decimals}f"
+    price = float(closes.iloc[-1])
+    lines = ["D1 technical indicators:"]
+
+    # MACD
+    macd_vals = _macd(closes)
+    if macd_vals:
+        ml, sl, hl = macd_vals
+        cross_lbl = (
+            "Bullish crossover ↑" if ml > sl and hl > 0 else
+            "Bearish crossover ↓" if ml < sl and hl < 0 else
+            "Bullish (line > signal)" if ml > sl else
+            "Bearish (line < signal)"
+        )
+        lines.append(
+            f"  MACD (12,26,9): Line={ml:+.5f}  Signal={sl:+.5f}  Hist={hl:+.5f}"
+            f"  → {cross_lbl}"
+        )
+
+    # Bollinger Bands
+    bb = _bollinger(closes, period=20, num_std=2.0)
+    if bb:
+        upper, mid, lower = bb
+        bb_width = round(upper - lower, 5)
+        if upper > lower:
+            pct_pos = round((price - lower) / (upper - lower) * 100, 1)
+            if pct_pos >= 80:
+                pos_lbl = f"{pct_pos}% — near upper band (extended)"
+            elif pct_pos <= 20:
+                pos_lbl = f"{pct_pos}% — near lower band (extended)"
+            else:
+                pos_lbl = f"{pct_pos}% of band range"
+        else:
+            pos_lbl = "—"
+        lines.append(
+            f"  BB (20,2)     : Upper={upper:{fmt}}  Mid={mid:{fmt}}  Lower={lower:{fmt}}"
+        )
+        lines.append(
+            f"  BB position   : {pos_lbl}  |  Width={bb_width:{fmt}} (~{round(bb_width/pip)}p)"
+        )
+
+    # ADX
+    adx_val = _adx(df)
+    if adx_val is not None:
+        adx_lbl = (
+            "strong trend (>40)"  if adx_val > 40 else
+            "trend developing"    if adx_val > 25 else
+            "weak / ranging"
+        )
+        lines.append(f"  ADX 14 (D1)  : {adx_val}  — {adx_lbl}")
+
+    return "\n".join(lines)
+
+
+def _section_mtf_confluence(
+    d1_dir: str,
+    h4_dir: str,
+    m15_dir: str,
+    d1_adx: float | None = None,
+) -> str:
+    """Multi-timeframe confluence summary."""
+    dirs = [d1_dir, h4_dir, m15_dir]
+    bullish_count = dirs.count("Bullish")
+    bearish_count = dirs.count("Bearish")
+
+    if bullish_count == 3:
+        verdict = "BULLISH ALIGNED — all 3 timeframes agree → elevated confidence long bias"
+    elif bearish_count == 3:
+        verdict = "BEARISH ALIGNED — all 3 timeframes agree → elevated confidence short bias"
+    elif bullish_count == 2:
+        verdict = "BULLISH LEANING — 2 of 3 timeframes agree → moderate long bias"
+    elif bearish_count == 2:
+        verdict = "BEARISH LEANING — 2 of 3 timeframes agree → moderate short bias"
+    else:
+        verdict = "CONFLICTED — timeframes disagree → wait for alignment or reduce size"
+
+    adx_note = ""
+    if d1_adx is not None:
+        if d1_adx > 40:
+            adx_note = f"  ADX {d1_adx} confirms strong trending conditions"
+        elif d1_adx < 20:
+            adx_note = f"  ADX {d1_adx} — weak trend; range conditions possible"
+
+    lines = [
+        "Multi-timeframe confluence:",
+        f"  D1 trend      : {d1_dir}",
+        f"  H4 trend      : {h4_dir}",
+        f"  M15 trend     : {m15_dir}",
+        f"  ── {verdict}",
+    ]
+    if adx_note:
+        lines.append(adx_note)
+    return "\n".join(lines)
+
+
 # ── yield spread ──────────────────────────────────────────────────────────────
 #
 # Data sources (all free, no API key):
@@ -551,6 +788,9 @@ def get_price_summary(symbol: str | None = None) -> str:
     bars = _m15_bars(sym)
     parts.append("\n" + _section_m15(bars, pip, decimals))
 
+    # H4 bars
+    h4_bars = _h4_bars(sym)
+
     # Daily data (backbone for all technical sections)
     df = _fetch_daily(yf_tick, period="1y")
     if df is not None and len(df) >= 20:
@@ -560,6 +800,33 @@ def get_price_summary(symbol: str | None = None) -> str:
         parts.append("\n" + _section_daily(df, decimals))
         parts.append("\n" + _section_trend(closes, df, bars, pip))
         parts.append("\n" + _section_key_levels(closes, df, price, pip, decimals))
+
+        # H4 indicators
+        h4_text, h4_dir = _section_h4(h4_bars, pip, decimals)
+        parts.append("\n" + h4_text)
+
+        # D1 MACD + Bollinger + ADX
+        parts.append("\n" + _section_indicators_d1(closes, df, pip, decimals))
+
+        # Multi-timeframe confluence summary
+        sma50  = _sma(closes, 50)
+        sma200 = _sma(closes, 200)
+        sma20  = _sma(closes, 20)
+        if sma50 and sma200:
+            if price > sma50 and sma50 > sma200:
+                d1_dir = "Bullish"
+            elif price < sma50 and sma50 < sma200:
+                d1_dir = "Bearish"
+            elif sma20 and sma20 > sma50:
+                d1_dir = "Mixed (bullish lean)"
+            else:
+                d1_dir = "Mixed"
+        else:
+            d1_dir = "Unknown"
+        m15_dir = _m15_direction(bars)
+        d1_adx  = _adx(df)
+        parts.append("\n" + _section_mtf_confluence(d1_dir, h4_dir, m15_dir, d1_adx))
+
         parts.append("\n" + _section_correlated(sym))
         ys = _section_yield_spread(sym)
         if ys:

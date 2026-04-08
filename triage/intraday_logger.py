@@ -37,6 +37,7 @@ def append_scored_articles(scored_items: list[dict[str, Any]]) -> None:
             record = {
                 "date": now_est.strftime("%Y-%m-%d"),
                 "time": now_est.strftime("%H:%M"),
+                "symbol": item.get("symbol", ""),
                 "source": item.get("source", ""),
                 "headline": item.get("headline") or item.get("title", ""),
                 "url": item.get("url", ""),
