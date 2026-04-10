@@ -89,8 +89,12 @@ CONTEXT_DAYS_PRICES = 30         # Days of price trend to include
 CONTEXT_MAX_TOKENS = 10000       # Hard cap — price agent now includes M15 bars + daily table
 
 # ── Market hours (UTC) — scanner only runs during these hours on weekdays ─────
-MARKET_HOURS_START = 7           # 07:00 UTC
-MARKET_HOURS_END = 23            # 23:00 UTC (7pm EDT / 6pm EST)
+# Covers full 24h-1h window: Tokyo (00-09), London (07-16), New York (12-21),
+# Sydney (22-07 overlap). The 23:00-00:00 UTC gap (quiet late-Sydney) is acceptable.
+# Note: is_market_hours() uses start <= hour < end and cannot wrap midnight, so
+# the full 24h range is approximated as 00:00-23:00 (missing only 23:00-00:00 UTC).
+MARKET_HOURS_START = 0           # 00:00 UTC — Tokyo / Singapore open
+MARKET_HOURS_END = 23            # 23:00 UTC — late NY / early Sydney close
 
 # ── Weekend schedule (EST) ────────────────────────────────────────────────────
 # Forex market closes Friday 5 PM EST, reopens Sunday 5 PM EST.

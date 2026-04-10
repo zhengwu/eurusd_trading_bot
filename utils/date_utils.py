@@ -78,8 +78,9 @@ def is_forex_market_open(
     if weekday == 6:                                     # Sunday after open — always active
         return True                                      # (UTC is already Mon 00:xx, window check would fail)
 
-    if weekday == 0 and datetime.now(UTC).hour < daily_start_utc:
+    if daily_start_utc > 0 and weekday == 0 and datetime.now(UTC).hour < daily_start_utc:
         return True                                      # Monday early morning — continuation of Sunday open
+                                                         # (only needed when daily_start_utc > 0; skipped for 24h mode)
 
     # Weekday — apply normal daily UTC window
     return is_market_hours(daily_start_utc, daily_end_utc)
