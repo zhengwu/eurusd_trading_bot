@@ -438,8 +438,34 @@ def fetch_fmp(start: date, end: date, max_items: int, symbol: str = "EURUSD") ->
 
 # ── Finnhub ───────────────────────────────────────────────────────────────────
 
-# Track last seen article ID per symbol so we only fetch new articles each poll
-_finnhub_last_id: dict[str, int] = {}
+_FINNHUB_CURSOR_FILE = config.DATA_DIR / ".finnhub_cursor.json"
+
+
+def _load_finnhub_cursors() -> dict[str, int]:
+    """Load persisted Finnhub minId cursors from disk. Returns {} on missing/corrupt file."""
+    try:
+        if _FINNHUB_CURSOR_FILE.exists():
+            import json as _json
+            return _json.loads(_FINNHUB_CURSOR_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"Could not load Finnhub cursor file: {e}")
+    return {}
+
+
+def _save_finnhub_cursors(cursors: dict[str, int]) -> None:
+    """Persist Finnhub minId cursors to disk so restarts don't re-fetch old articles."""
+    try:
+        import json as _json
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _FINNHUB_CURSOR_FILE.write_text(
+            _json.dumps(cursors, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"Could not save Finnhub cursor file: {e}")
+
+
+# Track last seen article ID per symbol — loaded from disk, persisted after each fetch
+_finnhub_last_id: dict[str, int] = _load_finnhub_cursors()
 
 
 def fetch_finnhub(start: date, end: date, max_items: int, symbol: str = "EURUSD") -> list[dict[str, Any]]:
@@ -512,9 +538,10 @@ def fetch_finnhub(start: date, end: date, max_items: int, symbol: str = "EURUSD"
         if len(out) >= max_items:
             break
 
-    # Advance the cursor so next poll only fetches newer articles
+    # Advance the cursor and persist so restarts don't re-fetch old articles
     if max_id_seen > min_id:
         _finnhub_last_id[symbol] = max_id_seen
+        _save_finnhub_cursors(_finnhub_last_id)
 
     return out
 
@@ -527,6 +554,21 @@ def fetch_finnhub(start: date, end: date, max_items: int, symbol: str = "EURUSD"
 _RSS_FEEDS = [
     ("https://www.forexlive.com/feed/news",  "ForexLive"),
     ("https://www.fxstreet.com/rss/news",    "FXStreet"),
+]
+
+# Headlines matching any of these patterns bypass the pair filter entirely.
+# These are macro events that move all major pairs regardless of explicit mention.
+_RSS_MACRO_OVERRIDE: list[str] = [
+    r"\btariff", r"\bsanction", r"\btrade.war\b", r"\btrade.deal\b",
+    r"\bTrump\b", r"\bBiden\b",
+    r"\bFed\b", r"\bfederal reserve\b", r"\bFOMC\b",
+    r"\brate.cut\b", r"\brate.hike\b", r"\bemergency.cut\b",
+    r"\bNFP\b", r"\bnonfarm\b", r"\bpayrolls\b",
+    r"\bCPI\b", r"\bPCE\b", r"\binflation\b",
+    r"\brecession\b", r"\bdefault\b", r"\bdebt.ceiling\b",
+    r"\brisk.off\b", r"\brisk.on\b", r"\bright.haven\b",
+    r"\bgeopolit", r"\bwar\b", r"\bceasefire\b",
+    r"\bS&P\b", r"\bVIX\b", r"\bstock.market\b",
 ]
 
 # Per-pair keyword filter — avoid RSS flooding the log with irrelevant cross-pair TA
@@ -609,11 +651,15 @@ def fetch_rss(start: date, end: date, max_items: int, symbol: str = "EURUSD") ->
             if dt and (dt.timestamp() < start_ts or dt.timestamp() > end_ts):
                 continue
 
-            # Keyword filter — skip articles with no pair-relevant terms
+            # Keyword filter — skip articles with no pair-relevant terms.
+            # Macro override: broad market-moving headlines (tariffs, NFP, Fed, etc.)
+            # bypass the pair filter so they reach all active pairs.
             text = title.lower()
             desc = (item.findtext("description") or "").lower()
             combined = text + " " + desc
-            if not any(re.search(p, combined, re.IGNORECASE) for p in patterns):
+            macro_hit = any(re.search(p, combined, re.IGNORECASE) for p in _RSS_MACRO_OVERRIDE)
+            pair_hit  = any(re.search(p, combined, re.IGNORECASE) for p in patterns)
+            if not macro_hit and not pair_hit:
                 continue
 
             seen.add(url)
