@@ -123,88 +123,86 @@ def _parse_judge_json(raw: str) -> dict:
 # ── Persona prompt templates ──────────────────────────────────────────────────
 
 _BULL_SYSTEM = (
-    "You are a highly aggressive Bullish forex analyst at a macro hedge fund. "
-    "Your entire career is built on finding long opportunities. "
-    "You are relentlessly optimistic about the base currency."
+    "You are a senior bullish forex analyst at a macro hedge fund. "
+    "Your job is to evaluate whether the data genuinely supports a long position — "
+    "not to argue for one regardless of the evidence."
 )
 
 _BULL_PROMPT = """\
-Make the strongest possible BULL CASE for going Long {display} right now.
+Assess the BULL CASE for going Long {display} based strictly on the evidence in the context below.
 
-Do NOT hedge. Do NOT mention risks to the upside view. Your job is to find \
-EVERY piece of evidence supporting a rally:
+Your score should reflect the actual strength of the data, not a pre-formed view:
+- If the macro, technical, and news data clearly support a rally, make a strong, specific case.
+- If the evidence is mixed, say so honestly — identify what supports a long AND where it is weak.
+- Do not invent bullish arguments that are not grounded in the context.
 
-- Central bank policy divergence that strengthens the base currency
-- Technical structure: support zones, bullish patterns, unfilled liquidity above,
-  break-and-retest levels, higher-lows structure
-- News and macro catalysts creating buying pressure
-- Correlated asset moves confirming bullish bias (DXY, yields, risk sentiment)
-- Rate cycle dynamics: who is hiking or pausing vs who is cutting aggressively?
-- Positioning and sentiment: is the market under-positioned for a rally?
+Evaluate each angle with the data actually present:
+- Central bank policy: is divergence genuinely favoring the base currency right now?
+- Technical structure: are support zones, patterns, and momentum actually bullish?
+- News and macro catalysts: do recent headlines create real buying pressure?
+- Correlated assets (DXY, yields, VIX, equities): are they confirming or contradicting?
+- Positioning: is there evidence of under-positioning or short-covering potential?
 
-Be specific with price levels and data from the context below.
+Be specific with price levels from the context.
 State your proposed entry, SL, and TP on the final line.
 
 === MARKET CONTEXT ===
 {context}
 
-Output your BULL CASE (250-400 words), then on the final line:
+Output your assessment (200-350 words), then on the final line:
 SETUP: Entry X.XXXXX | SL X.XXXXX | TP X.XXXXX | Conviction: High/Medium/Low
 """
 
 _BEAR_SYSTEM = (
-    "You are a highly aggressive Bearish forex analyst at a macro hedge fund. "
-    "Your entire career is built on finding short opportunities. "
-    "You are relentlessly pessimistic about the base currency."
+    "You are a senior bearish forex analyst at a macro hedge fund. "
+    "Your job is to evaluate whether the data genuinely supports a short position — "
+    "not to argue for one regardless of the evidence."
 )
 
 _BEAR_PROMPT = """\
-Make the strongest possible BEAR CASE for going Short {display} right now.
+Assess the BEAR CASE for going Short {display} based strictly on the evidence in the context below.
 
-Do NOT hedge. Do NOT mention risks to the downside view. Your job is to find \
-EVERY piece of evidence supporting a decline:
+Your score should reflect the actual strength of the data, not a pre-formed view:
+- If the macro, technical, and news data clearly support a decline, make a strong, specific case.
+- If the evidence is mixed, say so honestly — identify what supports a short AND where it is weak.
+- Do not invent bearish arguments that are not grounded in the context.
 
-- Central bank policy divergence that weakens the base currency
-- Technical structure: resistance zones, bearish patterns, unfilled liquidity below,
-  break-and-retest levels, lower-highs structure
-- News and macro catalysts creating selling pressure
-- Correlated asset moves confirming bearish bias (DXY, yields, risk-off moves)
-- Rate cycle dynamics: who is cutting aggressively vs who is hiking or pausing?
-- Positioning and sentiment: is the market over-positioned for a rally (crowded long)?
+Evaluate each angle with the data actually present:
+- Central bank policy: is divergence genuinely weakening the base currency right now?
+- Technical structure: are resistance zones, patterns, and momentum actually bearish?
+- News and macro catalysts: do recent headlines create real selling pressure?
+- Correlated assets (DXY, yields, VIX, equities): are they confirming or contradicting?
+- Positioning: is there evidence of over-positioning or long-unwinding potential?
 
-Be specific with price levels and data from the context below.
+Be specific with price levels from the context.
 State your proposed entry, SL, and TP on the final line.
 
 === MARKET CONTEXT ===
 {context}
 
-Output your BEAR CASE (250-400 words), then on the final line:
+Output your assessment (200-350 words), then on the final line:
 SETUP: Entry X.XXXXX | SL X.XXXXX | TP X.XXXXX | Conviction: High/Medium/Low
 """
 
 _DEVIL_SYSTEM = (
-    "You are the Devil's Advocate at a top hedge fund — a ruthless risk officer "
-    "whose specialty is identifying why proposed trades will fail. "
-    "You have saved the fund from dozens of bad trades by destroying weak theses."
+    "You are the Risk Assessor at a top hedge fund. "
+    "Your job is not to block trades — it is to identify the specific risks that could "
+    "derail this setup and give an honest probability for each. "
+    "If the risks are genuinely low, say so. If they are high, flag them clearly."
 )
 
 _DEVIL_PROMPT = """\
-A trade has been proposed on {display}. Your job is to DESTROY this thesis.
+A trade has been proposed on {display}. Assess the top risks to this setup RIGHT NOW.
 
-Argue specifically why this market setup is a TRAP and this trade will FAIL:
+Identify the 2-3 most concrete, specific risks that could cause this trade to fail:
+- Stop hunt / liquidity sweep: is the proposed SL sitting in an obvious hunt zone?
+- Event risk: is there a scheduled release or speech in the next 4-8 hours that could reverse the move?
+- Technical invalidation: which specific level, if broken, would negate the thesis entirely?
+- Regime mismatch: is the current volatility / session / market structure unfavorable for this trade type?
+- Setup quality: is the entry chasing, or is there a clean level with a well-defined invalidation?
 
-- What stop hunts or liquidity sweeps are likely near the proposed entry/SL?
-- What conflicting signals are being ignored or cherry-picked?
-- What event risk, news trap, or scheduled release could invalidate this immediately?
-- Which technical level is likely to be a fake-out rather than a real breakout?
-- Is the market in a regime where this type of trade historically fails
-  (low-volatility chop, news-driven reversal zones, end-of-session traps)?
-- Is the proposed SL too tight — will it get hunted before the move plays out?
-- Is the proposed TP too ambitious — where is the realistic take-profit given
-  current liquidity and structure?
-- What would need to be true for BOTH the Bull and Bear cases to be wrong?
-
-Be specific with price levels and data from the context below.
+For each risk you identify, rate its current probability: High / Medium / Low — and explain why
+based on the actual data in the context. Do not invent risks that are not present in the data.
 
 === MARKET CONTEXT ===
 {context}
@@ -215,8 +213,8 @@ Entry     : {entry}
 Stop Loss : {sl}
 Take Profit: {tp}
 
-Output your DEVIL'S CASE (250-400 words).
-Conclude with: Failure Probability: High/Medium/Low — and a one-sentence verdict.
+Output your risk assessment (200-350 words).
+Conclude with: Overall failure probability: High / Medium / Low — and a one-sentence summary.
 """
 
 
@@ -260,29 +258,42 @@ Rationale  : {rationale}
 {context}
 
 Scoring guide:
-  80-100 : Airtight — specific, data-backed, accounts for counter-arguments
-  60-79  : Solid — good logic but some gaps or ignored data
-  40-59  : Weak — plausible but relies on hope rather than evidence
-  1-39   : Poor — contradicted by the data, vague, or logically flawed
+  80-100 : Airtight — specific, data-backed, evidence clearly dominates
+  60-79  : Solid — good logic but some gaps or conflicting signals
+  40-59  : Weak — plausible but mixed evidence, relies on assumption
+  1-39   : Poor — contradicted by the data, vague, or unsupported
 
-Uncertainty guide:
-  High uncertainty (70-100) : Bull and Bear both score 65+, OR Neutral/Devil scores highest.
-                               The market is genuinely ambiguous — do not force a trade.
-  Medium uncertainty (40-69): One case is stronger but the counter-case has merit.
-                               Trade with reduced confidence.
-  Low uncertainty (1-39)    : One case clearly dominates. High conviction is warranted.
+Uncertainty guide — base your score on the GAP between the winning and losing case:
+  Low uncertainty (1-39)    : Winning case scores 70+ AND losing case scores below 50.
+                               One direction clearly dominates the data. High conviction.
+  Medium uncertainty (40-69): Winning case is stronger, but losing case scores 50-69.
+                               Genuine mixed signals — trade with reduced confidence.
+  High uncertainty (70-100) : Both Bull and Bear score 75+, OR the gap between them is
+                               under 10 points. The data is genuinely ambiguous.
+
+Primary analysis adjustment: The original signal was produced by a primary model using
+extended thinking (high-quality baseline). If its direction agrees with the winning case
+from the debate, reduce your uncertainty score by 10 points — this is meaningful
+confirmation from an independent, higher-context analysis.
+
+final_decision rules (strictly follow these):
+  - If uncertainty_score <= 70: Set final_decision to "Long" or "Short" — whichever of
+    Bull or Bear scored higher. DO NOT use "Wait" when uncertainty is low.
+  - If uncertainty_score is 71-75: Use "Wait" only if both Bull and Bear are genuinely
+    weak (both score < 55). Otherwise use the stronger direction.
+  - If uncertainty_score > 75: Use "Wait" freely — the situation is genuinely ambiguous.
 
 Return ONLY valid JSON, no other text:
 {{
   "evaluations": {{
     "bull_score": <int 1-100>,
     "bear_score": <int 1-100>,
-    "neutral_score": <int 1-100>,
-    "winning_case": "Bull | Bear | Neutral",
-    "flaws": "<one paragraph: key logical gaps or ignored data across all three arguments>"
+    "winning_case": "Bull | Bear",
+    "top_risk": "<one sentence: the single highest-priority risk identified by the Risk Assessor>",
+    "risk_level": "High | Medium | Low"
   }},
   "uncertainty_score": <int 1-100>,
-  "uncertainty_rationale": "<explain the score — e.g. 'Bull scores 78 and Bear scores 71, genuine disagreement; Neutral highlights a strong stop-hunt risk near the proposed SL'>",
+  "uncertainty_rationale": "<one sentence: why the scores produce this uncertainty level, e.g. 'Bull 72 vs Bear 58 — 14-pt gap, medium conviction; event risk tomorrow elevates uncertainty'>",
   "final_decision": "Long | Short | Wait",
   "confidence_override": "High | Medium | Low | null",
   "trade_setup": {{
@@ -298,15 +309,56 @@ Return ONLY valid JSON, no other text:
 
 # ── Async persona calls ───────────────────────────────────────────────────────
 
-async def _call_async(
-    client: anthropic.AsyncAnthropic,
+def _get_azure_async_client():
+    """Return AsyncAzureOpenAI client if Azure env vars are configured, else None."""
+    key      = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+    version  = os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview").strip()
+    if not key or not endpoint:
+        return None
+    try:
+        from openai import AsyncAzureOpenAI
+        return AsyncAzureOpenAI(
+            api_key=key,
+            azure_endpoint=endpoint,
+            api_version=version,
+        )
+    except Exception as e:
+        logger.warning(f"AsyncAzureOpenAI init failed: {e} — personas will use Haiku fallback")
+        return None
+
+
+async def _call_persona_async(
+    azure_client,                    # AsyncAzureOpenAI or None
+    claude_client: anthropic.AsyncAnthropic,
     system: str,
     prompt: str,
     label: str,
 ) -> str:
-    """Single async LLM call for one persona. Returns raw text."""
+    """
+    Single async persona call — Azure GPT-5.2 primary, Claude Haiku fallback.
+    Returns raw text.
+    """
+    # ── Try Azure first ──────────────────────────────────────────────────────
+    if azure_client is not None:
+        try:
+            deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
+            resp = await azure_client.chat.completions.create(
+                model=deployment,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": prompt},
+                ],
+                max_completion_tokens=700,
+                temperature=0.7,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning(f"Persona [{label}] Azure failed ({e}) — falling back to Haiku")
+
+    # ── Haiku fallback ───────────────────────────────────────────────────────
     try:
-        msg = await client.messages.create(
+        msg = await claude_client.messages.create(
             model=config.DEBATE_PERSONA_MODEL,
             max_tokens=700,
             system=system,
@@ -314,17 +366,26 @@ async def _call_async(
         )
         return msg.content[0].text.strip()
     except Exception as e:
-        logger.warning(f"Persona [{label}] failed: {e}")
+        logger.warning(f"Persona [{label}] Haiku fallback also failed: {e}")
         return f"[{label} unavailable: {e}]"
 
 
 async def _gather_personas_async(
     personas: list[tuple[str, str, str]],   # list of (system, prompt, label)
 ) -> list[str]:
-    """Run N persona calls concurrently. Returns responses in the same order."""
-    client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    """
+    Run N persona calls concurrently.
+    Uses Azure GPT-5.2 if configured, falls back to Claude Haiku per-call.
+    Returns responses in the same order.
+    """
+    azure_client  = _get_azure_async_client()
+    claude_client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    if azure_client:
+        logger.debug(f"Personas: using Azure {os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-5.2')} (Haiku fallback)")
+    else:
+        logger.debug(f"Personas: Azure not configured — using {config.DEBATE_PERSONA_MODEL}")
     return list(await asyncio.gather(*[
-        _call_async(client, system, prompt, label)
+        _call_persona_async(azure_client, claude_client, system, prompt, label)
         for system, prompt, label in personas
     ]))
 
@@ -775,22 +836,32 @@ def run_ensemble_debate(
             f"{config.DEBATE_MAX_UNCERTAINTY}. {debate_result.get('uncertainty_rationale', '')}"
         )
     elif final_dec != action:
-        # Judge disagrees with original signal direction
-        logger.info(
-            f"[{sym}] Judge overrides signal: {action} -> {final_dec} "
-            f"(uncertainty={uncertainty})"
-        )
-        signal["signal"]        = final_dec
-        signal["_debate_veto"]  = (
-            f"Judge overridden from {action} to {final_dec}. "
-            f"{debate_result.get('uncertainty_rationale', '')}"
-        )
+        # Judge disagrees with original signal direction.
+        # Guard: if the judge is trying to declare Wait but uncertainty is below threshold,
+        # ignore the Wait — the threshold veto above is the single gate for Wait downgrades.
+        # This prevents the neutral_score bias from silently blocking trades when the
+        # uncertainty score itself is acceptable.
+        if final_dec == "Wait" and uncertainty <= config.DEBATE_MAX_UNCERTAINTY:
+            logger.info(
+                f"[{sym}] Judge returned Wait but uncertainty {uncertainty} <= threshold "
+                f"{config.DEBATE_MAX_UNCERTAINTY} — keeping original signal {action}"
+            )
+        else:
+            logger.info(
+                f"[{sym}] Judge overrides signal: {action} -> {final_dec} "
+                f"(uncertainty={uncertainty})"
+            )
+            signal["signal"]        = final_dec
+            signal["_debate_veto"]  = (
+                f"Judge overridden from {action} to {final_dec}. "
+                f"{debate_result.get('uncertainty_rationale', '')}"
+            )
 
     evals = debate_result.get("evaluations", {})
     logger.info(
         f"[{sym}] Debate complete — Bull:{evals.get('bull_score')} "
-        f"Bear:{evals.get('bear_score')} Neutral:{evals.get('neutral_score')} "
-        f"Uncertainty:{uncertainty} -> {signal['signal']}"
+        f"Bear:{evals.get('bear_score')} Winner:{evals.get('winning_case')} "
+        f"Risk:{evals.get('risk_level')} Uncertainty:{uncertainty} -> {signal['signal']}"
     )
     return debate_result
 
@@ -809,7 +880,8 @@ def run_position_debate(
     Returns the debate_result dict with keys:
       evaluations.bull_score      — Hold case score
       evaluations.bear_score      — Exit case score
-      evaluations.neutral_score   — Devil's Advocate score
+      evaluations.risk_level      — High/Medium/Low from Risk Assessor
+      evaluations.top_risk        — one-sentence top risk from Risk Assessor
       uncertainty_score           — 1-100
       uncertainty_rationale
       final_decision              — "Hold" | "Trim" | "Exit"

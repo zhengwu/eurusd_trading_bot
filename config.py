@@ -26,11 +26,11 @@ TRIAGE_MODEL          = "claude-haiku-4-5-20251001"  # Fallback only — active 
 PRE_EVENT_BRIEF_MODEL = "claude-sonnet-4-6"          # Pre-event scenario brief — user-facing, quality matters
 ANALYSIS_MODEL        = "claude-sonnet-4-6"
 
-# Debate persona model — runs 3 concurrent calls, so cost/latency matters.
+# Debate persona model — fallback only; Azure GPT-5.2 is used when AZURE_OPENAI_API_KEY is set.
 # Haiku is fast and cheap; upgrade to Sonnet or Opus for higher-quality arguments.
 # DEBATE_PERSONA_MODEL = "claude-opus-4-6"        # Advanced — richest persona arguments
 # DEBATE_PERSONA_MODEL = "claude-sonnet-4-6"      # Balanced — good quality, moderate cost
-DEBATE_PERSONA_MODEL   = "claude-haiku-4-5-20251001"  # Fast/cheap — good enough for focused persona tasks
+DEBATE_PERSONA_MODEL   = "claude-haiku-4-5-20251001"  # Fallback only — active personas use Azure GPT-5.2
 
 # Debate judge model — the synthesis step; quality matters more here than for personas.
 # DEBATE_JUDGE_MODEL = "claude-opus-4-6"          # Advanced — sharpest CIO judgment
@@ -39,9 +39,17 @@ DEBATE_JUDGE_MODEL     = "claude-sonnet-4-6"      # Balanced — strong reasonin
 # ── Regime Engine ──────────────────────────────────────────────────────────────
 USE_REGIME_ANALYSIS = True   # Inject regime summary into LLM context window
 
+# ── Debate outcome tracking ────────────────────────────────────────────────────
+# Records pre/post-debate signals and fetches actual price at 8/16/24/48h via MT5.
+# Zero token cost. Data saved to data/outcome_log.json.
+# Set to False to disable entirely (no recording, no background checker thread).
+DEBATE_OUTCOME_TRACKING = True
+
 # ── Multi-Agent Debate / Ensemble ─────────────────────────────────────────────
 USE_MULTI_AGENT_DEBATE  = True   # Run Bull/Bear/Devil's Advocate debate on Long/Short signals
-DEBATE_MAX_UNCERTAINTY  = 70     # Signals with uncertainty_score > this are downgraded to Wait
+DEBATE_MAX_UNCERTAINTY  = 75     # Signals with uncertainty_score > this are downgraded to Wait
+                                 # Set conservatively at 75 pending calibration data — revisit after
+                                 # ~20 tracked signals in outcome_log.json (target: 78-80 long-term)
 
 # Central bank rate cycles — update after each meeting or major policy speech.
 #   stance   : "Hiking" | "Pausing" | "Cutting"

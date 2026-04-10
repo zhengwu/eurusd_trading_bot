@@ -16,6 +16,7 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 _DEVIATION = 20  # max price deviation in points
+_MIN_STOP_BUFFER_PIPS = 3  # extra pips added on top of broker minimum stop distance
 
 
 def _filling_mode(symbol: str) -> int:
@@ -36,6 +37,73 @@ def _last_error_str() -> str:
     return f"MT5 error {err[0]}: {err[1]}" if err else "unknown MT5 error"
 
 
+def _clamp_stops(
+    symbol: str,
+    direction: str,
+    price: float,
+    sl: float | None,
+    tp: float | None,
+) -> tuple[float | None, float | None]:
+    """
+    Ensure SL and TP respect the broker's minimum stop distance.
+
+    MT5 rejects orders with retcode=10016 (TRADE_RETCODE_INVALID_STOPS) when
+    SL or TP is within `stops_level` points of the execution price.  This
+    commonly happens when the LLM sets key_levels support/resistance very close
+    to the current market price.
+
+    We add _MIN_STOP_BUFFER_PIPS on top of the broker minimum as a safety margin
+    against fast-moving markets where the minimum itself is floating.
+    """
+    info = mt5.symbol_info(symbol)
+    if info is None or sl is None and tp is None:
+        return sl, tp
+
+    # stops_level is in points; point is the smallest price increment (0.00001 for 5-decimal pairs)
+    stops_level = info.stops_level or 0
+    min_dist = (stops_level + _MIN_STOP_BUFFER_PIPS * 10) * info.point  # 1 pip = 10 points for 5-decimal
+
+    if min_dist <= 0:
+        return sl, tp
+
+    if direction == "buy":
+        # SL must be at least min_dist below price
+        if sl is not None and price - sl < min_dist:
+            adjusted = round(price - min_dist, 5)
+            logger.warning(
+                f"SL {sl} too close to price {price} (min dist {min_dist:.5f}) "
+                f"— adjusted to {adjusted}"
+            )
+            sl = adjusted
+        # TP must be at least min_dist above price
+        if tp is not None and tp - price < min_dist:
+            adjusted = round(price + min_dist, 5)
+            logger.warning(
+                f"TP {tp} too close to price {price} (min dist {min_dist:.5f}) "
+                f"— adjusted to {adjusted}"
+            )
+            tp = adjusted
+    else:  # sell
+        # SL must be at least min_dist above price
+        if sl is not None and sl - price < min_dist:
+            adjusted = round(price + min_dist, 5)
+            logger.warning(
+                f"SL {sl} too close to price {price} (min dist {min_dist:.5f}) "
+                f"— adjusted to {adjusted}"
+            )
+            sl = adjusted
+        # TP must be at least min_dist below price
+        if tp is not None and price - tp < min_dist:
+            adjusted = round(price - min_dist, 5)
+            logger.warning(
+                f"TP {tp} too close to price {price} (min dist {min_dist:.5f}) "
+                f"— adjusted to {adjusted}"
+            )
+            tp = adjusted
+
+    return sl, tp
+
+
 def open_position(
     symbol: str,
     direction: str,          # "buy" or "sell"
@@ -54,6 +122,8 @@ def open_position(
         return {"ok": False, "error": f"No tick data for {symbol}"}
 
     price = tick.ask if direction == "buy" else tick.bid
+
+    sl, tp = _clamp_stops(symbol, direction, price, sl, tp)
 
     request = {
         "action":    mt5.TRADE_ACTION_DEAL,
@@ -168,6 +238,8 @@ def place_limit_order(
     Returns the same result dict shape as open_position().
     """
     order_type = mt5.ORDER_TYPE_BUY_LIMIT if direction == "buy" else mt5.ORDER_TYPE_SELL_LIMIT
+
+    sl, tp = _clamp_stops(symbol, direction, price, sl, tp)
 
     request = {
         "action":       mt5.TRADE_ACTION_PENDING,

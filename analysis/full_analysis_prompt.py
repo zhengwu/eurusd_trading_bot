@@ -121,6 +121,25 @@ def run_full_analysis(context_window: str, symbol: str | None = None) -> dict[st
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
+
+        # Log token usage so we can evaluate whether the 10K thinking budget is sufficient.
+        # output_tokens includes thinking + text; thinking_chars is a rough proxy for
+        # thinking token count (1 token ≈ 4 chars) when the thinking block is available.
+        usage = message.usage
+        thinking_block = next((b for b in message.content if b.type == "thinking"), None)
+        thinking_chars = len(thinking_block.thinking) if thinking_block else 0
+        thinking_tokens_est = thinking_chars // 4
+        logger.info(
+            f"[{sym}] Full analysis tokens — "
+            f"input={usage.input_tokens} output={usage.output_tokens} "
+            f"(thinking ~{thinking_tokens_est} est, budget=10000)"
+        )
+        if thinking_tokens_est >= 9000:
+            logger.warning(
+                f"[{sym}] Thinking budget near limit (~{thinking_tokens_est}/10000 est) "
+                f"— consider raising budget_tokens in full_analysis_prompt.py"
+            )
+
         # With thinking enabled, content is [ThinkingBlock, TextBlock].
         # Find the text block explicitly rather than assuming index 0.
         text_block = next(b for b in message.content if b.type == "text")

@@ -156,6 +156,19 @@ def main() -> None:
         f"(interval: {config.FAST_WATCH_INTERVAL_MINUTES} min)"
     )
 
+    # Start signal outcome checker in background thread
+    if config.DEBATE_OUTCOME_TRACKING:
+        from analysis.outcome_tracker import run_outcome_checker_loop
+        oc_thread = threading.Thread(
+            target=run_outcome_checker_loop,
+            daemon=True,
+            name="outcome-checker",
+        )
+        oc_thread.start()
+        logger.info("Signal outcome checker starting in background")
+    else:
+        logger.info("Signal outcome tracker disabled (USE_OUTCOME_TRACKER=False)")
+
     # Start Slack bot in background thread (no-ops if tokens not set)
     from agents.slack_bot import run_slack_bot
     bot_thread = threading.Thread(

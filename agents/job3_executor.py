@@ -212,6 +212,7 @@ def compute_order_preview(signal: dict[str, Any], symbol: str | None = None) -> 
 
         tp_pips = abs(tp_price - current_price) / pip if tp_price else None
         rr = round(tp_pips / sl_pips, 2) if tp_pips and sl_pips > 0 else None
+        rr_warning = rr is not None and rr < 1.5
 
         return {
             "entry_price": round(current_price, decimals),
@@ -222,6 +223,7 @@ def compute_order_preview(signal: dict[str, Any], symbol: str | None = None) -> 
             "lot_size":    lot,
             "risk_amount": risk_amount,
             "risk_reward": f"1:{rr}" if rr else None,
+            "rr_warning":  rr_warning,   # True when R:R < 1.5
             "live_price":  tick is not None,
         }
     except Exception as e:

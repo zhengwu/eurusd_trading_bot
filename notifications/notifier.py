@@ -77,7 +77,7 @@ def _format_alert(signal: dict[str, Any], trigger_item: dict[str, Any] | None = 
         f"\n  Invalidation:\n  {signal.get('invalidation', '')}\n"
         f"\n  Risk Note:\n  {signal.get('risk_note', '')}\n"
         + _fmt_order_preview(signal.get("_order_preview"))
-        + _fmt_debate(signal.get("_debate"), signal.get("_uncertainty_score"), signal.get("_debate_veto"))
+        + _fmt_debate(signal.get("_debate"), signal.get("_uncertainty_score"), signal.get("_debate_veto"), signal.get("signal", ""))
         + f"{'═' * 55}"
     )
 
@@ -86,6 +86,7 @@ def _fmt_order_preview(preview: dict | None) -> str:
     if not preview:
         return ""
     src = " (live)" if preview.get("live_price") else " (estimated)"
+    rr_warn = "  [!] R:R below 1.5 — consider skipping" if preview.get("rr_warning") else ""
     return (
         f"\n  Order Details{src}:\n"
         f"    Entry      : {preview.get('entry_price', '—')}\n"
@@ -93,37 +94,56 @@ def _fmt_order_preview(preview: dict | None) -> str:
         f"    TP         : {preview.get('tp', '—')}  (+{preview.get('tp_pips', '—')} pips)\n"
         f"    Lot        : {preview.get('lot_size', '—')}\n"
         f"    Risk       : ${preview.get('risk_amount', '—')}\n"
-        f"    R:R        : {preview.get('risk_reward', '—')}\n"
+        f"    R:R        : {preview.get('risk_reward', '—')}{rr_warn}\n"
     )
+
+
+def _debate_header(signal_action: str, final_d: str, unc: int | None, veto_reason: str | None) -> str:
+    """Return a single-line debate outcome label based on what actually happened."""
+    if veto_reason:
+        return "Ensemble Debate — VETOED"
+    if not isinstance(unc, int):
+        return "Ensemble Debate"
+    if final_d == signal_action:
+        # Judge confirmed the original direction
+        if unc <= 39:
+            return f"Ensemble Debate — Confirmed {signal_action} (high conviction)"
+        return f"Ensemble Debate — Confirmed {signal_action} (uncertainty {unc}/100)"
+    if final_d in ("Long", "Short") and final_d != signal_action:
+        return f"Ensemble Debate — Direction flipped to {final_d} (uncertainty {unc}/100)"
+    # Wait was blocked by code guard — signal survived
+    return f"Ensemble Debate — Proceeded with caution (uncertainty {unc}/100)"
 
 
 def _fmt_debate(
     debate: dict | None,
     uncertainty: int | None,
     veto_reason: str | None,
+    signal_action: str = "",
 ) -> str:
     if not debate:
         return ""
-    evals    = debate.get("evaluations") or {}
-    bull     = evals.get("bull_score", "?")
-    bear     = evals.get("bear_score", "?")
-    neut     = evals.get("neutral_score", "?")
-    win      = evals.get("winning_case", "?")
-    flaws    = evals.get("flaws", "")
-    unc      = uncertainty if uncertainty is not None else debate.get("uncertainty_score", "?")
-    rat      = debate.get("uncertainty_rationale", "")
-    final_d  = debate.get("final_decision", "")
-    conf_ov  = debate.get("confidence_override") or ""
-    setup    = debate.get("trade_setup") or {}
-    entry_as = setup.get("entry_assessment", "")
-    sl_ass   = setup.get("sl_assessment", "")
-    tp_ass   = setup.get("tp_assessment", "")
-    sl_adj   = setup.get("suggested_sl_adjustment")
-    tp_adj   = setup.get("suggested_tp_adjustment")
-    veto     = f"\n  [!] VETO: {veto_reason}\n" if veto_reason else ""
+    evals     = debate.get("evaluations") or {}
+    bull      = evals.get("bull_score", "?")
+    bear      = evals.get("bear_score", "?")
+    win       = evals.get("winning_case", "?")
+    top_risk  = evals.get("top_risk", "")
+    risk_lvl  = evals.get("risk_level", "")
+    unc       = uncertainty if uncertainty is not None else debate.get("uncertainty_score", "?")
+    rat       = debate.get("uncertainty_rationale", "")
+    final_d   = debate.get("final_decision", "")
+    conf_ov   = debate.get("confidence_override") or ""
+    setup     = debate.get("trade_setup") or {}
+    entry_as  = setup.get("entry_assessment", "")
+    sl_ass    = setup.get("sl_assessment", "")
+    tp_ass    = setup.get("tp_assessment", "")
+    sl_adj    = setup.get("suggested_sl_adjustment")
+    tp_adj    = setup.get("suggested_tp_adjustment")
+    veto      = f"\n  [!] VETO: {veto_reason}\n" if veto_reason else ""
 
-    conf_str = f" [{conf_ov}]" if conf_ov and conf_ov != "null" else ""
-    adj_line = ""
+    header    = _debate_header(signal_action, final_d, unc if isinstance(unc, int) else None, veto_reason)
+    conf_str  = f" [{conf_ov}]" if conf_ov and conf_ov != "null" else ""
+    adj_line  = ""
     if sl_adj or tp_adj:
         adj_line = (
             f"\n  Adjustments:\n"
@@ -138,12 +158,13 @@ def _fmt_debate(
     if tp_ass:
         assess_lines += f"    TP         : {tp_ass}\n"
 
+    risk_line = f"    Top Risk   : [{risk_lvl}] {top_risk}\n" if top_risk else ""
+
     return (
-        f"\n  Ensemble Debate:\n"
-        f"    Scores     : Bull {bull} | Bear {bear} | Neutral {neut} | Winner: {win}\n"
-        f"    Uncertainty: {unc}/100\n"
-        f"    Rationale  : {rat}\n"
-        + (f"    Flaws      : {flaws}\n" if flaws else "")
+        f"\n  {header}:\n"
+        f"    Scores     : Bull {bull} | Bear {bear} | Winner: {win}\n"
+        f"    Uncertainty: {unc}/100  — {rat}\n"
+        + risk_line
         + (f"    Verdict    : {final_d}{conf_str}\n" if final_d else "")
         + (f"  Trade Setup Assessment:\n" + assess_lines if assess_lines else "")
         + adj_line
@@ -189,6 +210,45 @@ def _notify_email(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
         logger.error(f"Email notification failed: {e}")
 
 
+def _build_signal_blocks(text: str, signal_id: str | None, signal_label: str) -> list[dict]:
+    """
+    Wrap the signal text in Slack Block Kit blocks and append Approve/Reject buttons
+    for actionable signals (Long/Short with a signal_id).
+
+    Splits text into ≤2900-char sections to respect Slack's per-block limit.
+    """
+    blocks: list[dict] = []
+    chunk_size = 2900
+    for i in range(0, len(text), chunk_size):
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text[i : i + chunk_size]},
+        })
+
+    if signal_id and signal_label in ("Long", "Short"):
+        btn_text = ":chart_with_upwards_trend: Execute Long" if signal_label == "Long" else ":chart_with_downwards_trend: Execute Short"
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": btn_text, "emoji": True},
+                    "style": "primary",
+                    "action_id": "approve_signal",
+                    "value": signal_id,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": ":x: Reject", "emoji": True},
+                    "style": "danger",
+                    "action_id": "reject_signal",
+                    "value": signal_id,
+                },
+            ],
+        })
+    return blocks
+
+
 def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -> None:
     webhook_url = os.getenv("SLACK_WEBHOOK_URL")
     if not webhook_url:
@@ -223,31 +283,32 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
     order_preview = signal.get("_order_preview") or {}
     order_line = ""
     if order_preview:
-        entry  = order_preview.get("entry_price", "—")
-        sl     = order_preview.get("sl", "—")
-        tp     = order_preview.get("tp", "—")
-        sl_p   = order_preview.get("sl_pips", "—")
-        tp_p   = order_preview.get("tp_pips", "—")
-        lot    = order_preview.get("lot_size", "—")
-        risk   = order_preview.get("risk_amount", "—")
-        rr     = order_preview.get("risk_reward", "—")
-        live   = " _(live)_" if order_preview.get("live_price") else " _(estimated)_"
+        entry   = order_preview.get("entry_price", "—")
+        sl      = order_preview.get("sl", "—")
+        tp      = order_preview.get("tp", "—")
+        sl_p    = order_preview.get("sl_pips", "—")
+        tp_p    = order_preview.get("tp_pips", "—")
+        lot     = order_preview.get("lot_size", "—")
+        risk    = order_preview.get("risk_amount", "—")
+        rr      = order_preview.get("risk_reward", "—")
+        live    = " _(live)_" if order_preview.get("live_price") else " _(estimated)_"
+        rr_warn = "  :warning: _R:R below 1.5_" if order_preview.get("rr_warning") else ""
         order_line = (
             f"\n\n*Order Details*{live}\n"
             f">Entry `{entry}`  SL `{sl}` (-{sl_p}p)  TP `{tp}` (+{tp_p}p)\n"
-            f">Lot `{lot}`  Risk `${risk}`  R:R `{rr}`"
+            f">Lot `{lot}`  Risk `${risk}`  R:R `{rr}`{rr_warn}"
         )
 
     # Ensemble debate block
-    debate      = signal.get("_debate") or {}
-    debate_line = ""
+    debate       = signal.get("_debate") or {}
+    debate_line  = ""
     if debate:
         evals    = debate.get("evaluations") or {}
         bull_s   = evals.get("bull_score", "?")
         bear_s   = evals.get("bear_score", "?")
-        neut_s   = evals.get("neutral_score", "?")
         win      = evals.get("winning_case", "?")
-        flaws    = evals.get("flaws", "")
+        top_risk = evals.get("top_risk", "")
+        risk_lvl = evals.get("risk_level", "")
         unc      = signal.get("_uncertainty_score", debate.get("uncertainty_score", "?"))
         unc_rat  = debate.get("uncertainty_rationale", "")
         final_d  = debate.get("final_decision", "")
@@ -265,24 +326,34 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
             ":large_yellow_circle:" if isinstance(unc, int) and unc <= 69 else
             ":red_circle:"
         )
-        dec_emoji = {
-            "Long":  ":chart_with_upwards_trend:",
-            "Short": ":chart_with_downwards_trend:",
-            "Wait":  ":pause_button:",
-        }.get(final_d, ":scales:")
+        risk_emoji = {
+            "High":   ":red_circle:",
+            "Medium": ":large_yellow_circle:",
+            "Low":    ":large_green_circle:",
+        }.get(risk_lvl, ":white_circle:")
+
+        # Debate outcome header — reflects what actually happened
+        header = _debate_header(
+            signal_action=signal_label,
+            final_d=final_d,
+            unc=unc if isinstance(unc, int) else None,
+            veto_reason=veto or None,
+        )
 
         debate_line = (
-            f"\n\n*Ensemble Debate — Long/Short/Wait?*\n"
+            f"\n\n*{header}*\n"
             f">:chart_with_upwards_trend: Bull `{bull_s}` | "
-            f":chart_with_downwards_trend: Bear `{bear_s}` | "
-            f":scales: Neutral `{neut_s}` | Winner: *{win}*\n"
-            f">{unc_emoji} *Uncertainty:* `{unc}/100` — {unc_rat}"
+            f":chart_with_downwards_trend: Bear `{bear_s}` | Winner: *{win}*\n"
+            f">{unc_emoji} Uncertainty `{unc}/100` — {unc_rat}"
         )
-        if flaws:
-            debate_line += f"\n>:speech_balloon: _{flaws}_"
+        if top_risk:
+            debate_line += f"\n>{risk_emoji} *Top risk [{risk_lvl}]:* {top_risk}"
         if final_d:
             conf_str = f" [{conf_ov}]" if conf_ov and conf_ov != "null" else ""
-            debate_line += f"\n\n{dec_emoji} *Judge verdict: {final_d}*{conf_str}"
+            if veto:
+                debate_line += f"\n>:no_entry: *Vetoed — {veto}*"
+            elif final_d != signal_label:
+                debate_line += f"\n>:scales: Judge adjusted to *{final_d}*{conf_str}"
         if entry_as:
             debate_line += f"\n>:mag: Entry: {entry_as}"
         if sl_ass:
@@ -295,19 +366,9 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
                 + (f" SL -> `{sl_adj}`" if sl_adj else "")
                 + (f" TP -> `{tp_adj}`" if tp_adj else "")
             )
-        if veto:
-            debate_line += f"\n>:no_entry: *{veto}*"
 
-    # Show signal ID + approval / chat instructions
     signal_id = signal.get("_signal_id")
     source = signal.get("_source", "job1")
-    approval_line = ""
-    if signal_id and signal_label not in ("Wait", "Hold"):
-        approval_line = (
-            f"\n\n:white_check_mark: *To execute:* `approve {signal_id}`"
-            f"\n:pencil: *To modify SL/TP/lot:* type `chat` and ask me"
-            f"\n:x: *To reject:*  `reject {signal_id}`"
-        )
 
     # Source label for Job 2 position alerts
     source_label = " _(Position Monitor)_" if source == "job2" else ""
@@ -351,13 +412,19 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
         f">*Risk Note:* {signal.get('risk_note', '')}"
         f"{order_line}"
         f"{debate_line}"
-        f"{approval_line}"
+        + (f"\n\n:pencil: _To modify SL/TP/lot before executing: type `chat` and ask me_"
+           if signal_id and signal_label not in ("Wait", "Hold") else "")
     )
+
+    # Build Block Kit payload — buttons for actionable signals, plain text fallback for others
+    payload: dict[str, Any] = {"text": text}
+    if signal_id and signal_label not in ("Wait", "Hold"):
+        payload["blocks"] = _build_signal_blocks(text, signal_id, signal_label)
 
     try:
         resp = requests.post(
             webhook_url,
-            data=json.dumps({"text": text}),
+            data=json.dumps(payload),
             headers={"Content-Type": "application/json"},
             timeout=10,
         )

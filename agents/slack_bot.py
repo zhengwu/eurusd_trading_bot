@@ -62,6 +62,7 @@ _HELP_TEXT = (
     "> `journal` — show the 10 most recent trade journal entries\n"
     "> `journal report` — performance summary (win rate, pips, P&L)\n"
     "> `journal validate` — force validation of pending journal records against MT5\n"
+    "> `outcomes` — debate vs Sonnet accuracy tracker (false negatives / false positives @ 8/16/24/48h)\n"
     "> `help` — show this message\n"
     "> _Any other message starts a conversation — ask me anything about the market or your positions_"
 )
@@ -444,6 +445,40 @@ def _do_journal_validate(say: Callable) -> None:
     say(f":white_check_mark: Journal validation complete — {n} record(s) updated.")
 
 
+def _do_outcomes(say: Callable) -> None:
+    """Show signal outcome tracking summary — debate accuracy vs Sonnet baseline."""
+    from analysis.outcome_tracker import get_outcome_summary
+    s = get_outcome_summary()
+
+    if s.get("total", 0) == 0:
+        say(":bar_chart: No signals recorded yet — outcomes will appear after the next alert.")
+        return
+
+    fn = s.get("false_negatives_24h", [])
+    fp = s.get("false_positives_24h", [])
+
+    fn_str = (
+        ", ".join(f"{r['id']} ({r['pip_move']:+.0f}p)" for r in fn)
+        if fn else "none yet"
+    )
+    fp_str = (
+        ", ".join(f"{r['id']} ({r['pip_move']:+.0f}p)" for r in fp)
+        if fp else "none yet"
+    )
+
+    msg = (
+        f":bar_chart: *Signal Outcome Tracker*\n"
+        f">Total signals tracked: *{s['total']}* "
+        f"(complete: {s['complete']}, partial: {s['partial']}, pending: {s['pending']})\n"
+        f">Debate changed signal: *{s['debate_changed']}* "
+        f"(overrode to Wait: {s['overrides_to_wait']})\n"
+        f">*False negatives @ 24h* (debate blocked good signal): {fn_str}\n"
+        f">*False positives @ 24h* (debate let bad signal through): {fp_str}\n"
+        f"_Raw data: `data/outcome_log.json`_"
+    )
+    say(msg)
+
+
 def _do_debate_positions(say: Callable, symbol: str | None = None) -> None:
     """Run the position ensemble debate on all open positions (or one symbol)."""
     from mt5.connector import is_connected
@@ -764,6 +799,8 @@ def _dispatch(text: str, say: Callable) -> bool:
         _run_in_thread(say, _do_journal_report)
     elif re.fullmatch(r"journal\s+validate?", clean):
         _run_in_thread(say, _do_journal_validate)
+    elif re.fullmatch(r"outcomes?|debate\s+accuracy|calibrat\w*", clean):
+        _run_in_thread(say, _do_outcomes)
     elif clean == "help":
         say(_HELP_TEXT)
     elif re.fullmatch(r"hi|hello|hey|introduce|who are you", clean):
@@ -821,10 +858,40 @@ def _do_chat(say: Callable, thread_ts: str, text: str) -> None:
     if reply:
         say(reply)
     for signal_id in proposals:
+        from pipeline.signal_store import get_signal_by_id
+        proposal = get_signal_by_id(signal_id) or {}
+        direction = proposal.get("signal", "Long")
+        btn_text = ":chart_with_upwards_trend: Execute Long" if direction == "Long" else ":chart_with_downwards_trend: Execute Short"
         say(
-            f":pencil: *Order proposed — Signal ID: `{signal_id}`*\n"
-            f">:white_check_mark: To execute: `approve {signal_id}`\n"
-            f">:x: To cancel:  `reject {signal_id}`"
+            text=f":pencil: Order proposed — Signal `{signal_id}` ({direction}). Use the buttons below or `approve {signal_id}` / `reject {signal_id}`.",
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":pencil: *Order proposed — Signal `{signal_id}`* ({direction})\n_To modify SL/TP/lot: ask me in this thread before executing._",
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": btn_text, "emoji": True},
+                            "style": "primary",
+                            "action_id": "approve_signal",
+                            "value": signal_id,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": ":x: Cancel", "emoji": True},
+                            "style": "danger",
+                            "action_id": "reject_signal",
+                            "value": signal_id,
+                        },
+                    ],
+                },
+            ],
         )
 
 
@@ -910,6 +977,90 @@ def _get_app() -> App:
             if _dispatch(text, say):
                 return
             _run_in_thread(tsay, _do_chat, thread_ts, text)
+
+        # ── Button action handlers ────────────────────────────────────────────
+
+        @_app.action("approve_signal")
+        def handle_approve_button(ack, body, respond):
+            """Handle the Execute button on a signal alert."""
+            ack()
+            signal_id = body["actions"][0]["value"]
+            user = body.get("user", {}).get("name", "someone")
+
+            # Remove buttons immediately — show processing state
+            original_blocks = body.get("message", {}).get("blocks", [])
+            processing_blocks = [b for b in original_blocks if b.get("type") != "actions"]
+            processing_blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f":hourglass: Executing signal `{signal_id}`… (approved by @{user})"}],
+            })
+            try:
+                respond(replace_original=True, blocks=processing_blocks, text=f"Executing {signal_id}…")
+            except Exception as e:
+                logger.warning(f"Could not update message during approve: {e}")
+
+            def _run():
+                from agents.job3_executor import approve_and_execute
+                result = approve_and_execute(signal_id)
+                if result.get("ok"):
+                    ticket = result.get("ticket", "?")
+                    price  = result.get("price", "?")
+                    volume = result.get("volume", "?")
+                    if result.get("order_type") == "limit":
+                        status = (
+                            f":white_check_mark: *Limit order placed* by @{user} — "
+                            f"Signal `{signal_id}` | Ticket `{ticket}` | "
+                            f"Limit `{price}` _(pending fill)_ | Volume `{volume}` lots"
+                        )
+                    else:
+                        status = (
+                            f":white_check_mark: *Executed* by @{user} — "
+                            f"Signal `{signal_id}` | Ticket `{ticket}` | "
+                            f"Fill `{price}` | Volume `{volume}` lots"
+                        )
+                else:
+                    status = f":x: *Execution failed* — Signal `{signal_id}`: {result.get('error')}"
+
+                result_blocks = [b for b in original_blocks if b.get("type") != "actions"]
+                result_blocks.append({
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": status}],
+                })
+                try:
+                    respond(replace_original=True, blocks=result_blocks, text=status)
+                except Exception as e:
+                    logger.error(f"Could not update message after approve: {e}")
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        @_app.action("reject_signal")
+        def handle_reject_button(ack, body, respond):
+            """Handle the Reject button on a signal alert."""
+            ack()
+            signal_id = body["actions"][0]["value"]
+            user = body.get("user", {}).get("name", "someone")
+            original_blocks = body.get("message", {}).get("blocks", [])
+
+            from pipeline.signal_store import reject_signal as _reject
+            if _reject(signal_id):
+                try:
+                    from analysis.trade_journal import reject_in_journal
+                    reject_in_journal(signal_id)
+                except Exception as e:
+                    logger.error(f"Journal reject failed: {e}")
+                status = f":x: Signal `{signal_id}` *rejected* by @{user}."
+            else:
+                status = f":x: Signal `{signal_id}` not found (may have already been actioned)."
+
+            result_blocks = [b for b in original_blocks if b.get("type") != "actions"]
+            result_blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": status}],
+            })
+            try:
+                respond(replace_original=True, blocks=result_blocks, text=status)
+            except Exception as e:
+                logger.error(f"Could not update message after reject: {e}")
 
     return _app
 

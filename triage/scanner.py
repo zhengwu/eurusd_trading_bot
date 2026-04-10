@@ -234,6 +234,10 @@ def _run_pair_scan(symbol: str) -> list[dict]:
             if preview:
                 signal["_order_preview"] = preview
 
+            # Snapshot Sonnet's decision before the debate may override it
+            _pre_debate_signal     = signal.get("signal")
+            _pre_debate_confidence = signal.get("confidence")
+
             # Run ensemble debate (mutates signal in-place)
             if config.USE_MULTI_AGENT_DEBATE:
                 try:
@@ -251,6 +255,44 @@ def _run_pair_scan(symbol: str) -> list[dict]:
             signal["_signal_id"] = signal_id
             signal["_source"] = "job1"
             logger.info(f"[{symbol}] Signal saved for approval: {signal_id}")
+
+            # Record signal + debate metadata for outcome tracking
+            if config.DEBATE_OUTCOME_TRACKING:
+                try:
+                    from analysis.outcome_tracker import record_signal
+                    entry_price = (signal.get("_order_preview") or {}).get("entry_price")
+                    record_signal(
+                        signal=signal,
+                        symbol=symbol,
+                        entry_price=entry_price,
+                        pre_debate_signal=_pre_debate_signal,
+                        pre_debate_confidence=_pre_debate_confidence,
+                    )
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Outcome tracking failed (non-fatal): {e}")
+
+        # Record Wait signals for outcome tracking (no debate runs for Wait)
+        # Guard: skip if _signal_id already set — means the Long/Short block already
+        # recorded this signal and debate downgraded it to Wait (overwrite bug prevention)
+        if config.DEBATE_OUTCOME_TRACKING and signal.get("signal") == "Wait" and not signal.get("_signal_id"):
+            try:
+                from analysis.outcome_tracker import record_signal
+                from mt5.connector import is_connected
+                import MetaTrader5 as _mt5
+                if is_connected():
+                    _tick = _mt5.symbol_info_tick(symbol)
+                    entry_price = round((_tick.bid + _tick.ask) / 2, 6) if _tick else None
+                else:
+                    entry_price = None
+                record_signal(
+                    signal=signal,
+                    symbol=symbol,
+                    entry_price=entry_price,
+                    pre_debate_signal="Wait",
+                    pre_debate_confidence=signal.get("confidence"),
+                )
+            except Exception as e:
+                logger.warning(f"[{symbol}] Outcome tracking (Wait) failed (non-fatal): {e}")
 
         notify(signal, trigger_item=trigger)
         logger.info(
