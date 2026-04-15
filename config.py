@@ -241,6 +241,22 @@ JOB3_MIN_LOT                 = 0.01  # Minimum lot size
 JOB3_MAX_LOT                 = 5.0   # Maximum lot size
 JOB3_DEFAULT_SL_PIPS         = 30    # Fallback SL if key_levels missing
 JOB3_DEFAULT_TP_PIPS         = 60    # Fallback TP if key_levels missing
+
+# Minimum risk:reward ratio required to execute a Long or Short signal.
+#
+# R:R = TP distance (pips) / SL distance (pips)
+# A ratio of 1.0 means TP and SL are equidistant from entry — every winning trade
+# exactly offsets one losing trade, so the strategy breaks even at 50% win rate.
+#
+# Why 1.0 and not higher?
+#   A tighter filter (e.g. 1.5) rejects more setups and improves average trade quality,
+#   but also means fewer signals. 1.0 is a floor — it blocks only clearly negative-edge
+#   setups (TP < SL) where you risk more than you can win. Once calibration data from
+#   outcome_log.json accumulates, raise this to 1.2–1.5 if win rate data supports it.
+#
+# Signals that fail this check are rejected at execution time (Job 3) and are also
+# filtered upstream in the analysis prompt, so the LLM should not generate them at all.
+JOB3_MIN_RR                  = 1.0   # Minimum TP/SL ratio — block execution below this
 JOB3_SIGNAL_EXPIRY_MINUTES   = 60    # Signal auto-expires if not approved in time
 
 # Uncertainty-based lot sizing — risk % multipliers by uncertainty tier

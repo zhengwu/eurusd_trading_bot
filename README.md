@@ -174,6 +174,8 @@ For new positions (Long/Short), Job 3 calculates lot size using **uncertainty-sc
 
 Lot = `(equity × effective_risk%) / (sl_pips × pip_value_per_lot)`, clamped to `[JOB3_MIN_LOT, JOB3_MAX_LOT]` (default 0.01 – 5.0). Pip values are pair-aware — USD-quote pairs use $10/pip per standard lot; JPY pairs use the approximate JPY pip value configured in `config.py`.
 
+**Minimum R:R gate.** Before placing any order, Job 3 computes `R:R = TP distance / SL distance` from the live prices. If R:R < `JOB3_MIN_RR` (default 1.0), the signal is rejected — even if already approved. The analysis prompt enforces the same threshold upstream so the LLM outputs `Wait` instead of generating unviable setups in the first place.
+
 ### Job 4 — Chat Assistant
 
 Job 4 is a conversational interface that can be seeded with a pair's market analysis. Start a session with `chat`, `chat GBPUSD`, or `chat USDJPY`. Claude opens with the full market analysis pre-loaded and then answers questions with live tool access:
@@ -837,6 +839,7 @@ To remove a pair: remove it from `ACTIVE_PAIRS`. Everything else adapts automati
 | `JOB3_MAX_LOT` | 5.0 | Maximum lot size cap |
 | `JOB3_UNCERTAINTY_TIERS` | see config | Tiered risk multipliers: ≤30→100%, ≤55→75%, ≤75→50% |
 | `JOB3_AUTO_APPROVE_MAX_UNCERTAINTY` | 30 | Auto-execute without approval when uncertainty ≤ this. Set to `None` to disable. |
+| `JOB3_MIN_RR` | 1.0 | Minimum R:R (TP÷SL) to execute. Signals below this are blocked at execution and filtered in the analysis prompt. Raise to 1.2–1.5 once win-rate data is available. |
 | `JOB3_SIGNAL_EXPIRY_MINUTES` | 60 | How long a signal stays valid before auto-expiring |
 | `MARKET_HOURS_START` / `END` | 7 / 23 | Active scanning window (UTC hour) |
 | `DAILY_COLLECTION_TIME_UTC` | `"22:00"` | When end-of-day collection runs |

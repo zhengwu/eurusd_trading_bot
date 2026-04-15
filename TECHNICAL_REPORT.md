@@ -1089,7 +1089,22 @@ A 3-pip buffer (`_MIN_STOP_BUFFER_PIPS = 3`) is added on top of the broker minim
 
 ### R:R warning
 
-`compute_order_preview()` now includes a `rr_warning: bool` field set to `True` when the computed risk-reward ratio is below 1.5. This is surfaced as a ⚠️ inline on the Slack order line so the trader can evaluate the setup before approving.
+`compute_order_preview()` includes a `rr_warning: bool` field set to `True` when the computed risk-reward ratio is below 1.5. This is surfaced as a ⚠️ inline on the Slack order line so the trader can evaluate the setup before approving.
+
+### Minimum R:R gate
+
+A hard execution gate enforces `JOB3_MIN_RR` (default: 1.0) before any Long/Short order is placed. R:R is computed live from the signal's SL and TP prices at execution time:
+
+```python
+tp_pips = abs(tp_price - current_price) / pip
+rr      = tp_pips / sl_pips
+if rr < config.JOB3_MIN_RR:
+    return {"ok": False, "error": f"R:R {rr:.2f} below minimum {config.JOB3_MIN_RR} — signal rejected"}
+```
+
+This is a backstop — it fires even if a user manually approves a signal from Slack. The upstream analysis prompt also enforces the same threshold as a generation-time constraint: rule 7 in `_PROMPT_TEMPLATE` instructs the LLM to output `Wait` instead of a directional signal when the nearest real technical TP level does not give R:R ≥ `JOB3_MIN_RR`. Both the prompt rule and the execution gate read from `config.JOB3_MIN_RR` so changing the value in one place applies everywhere.
+
+**Why 1.0 as the floor:** A ratio below 1.0 means TP is closer than SL — every winning trade is smaller than every losing trade. The strategy requires a win rate above 50% just to break even, with no margin for slippage or spread. 1.0 is the minimum viable edge. Raise to 1.2–1.5 once `outcome_log.json` has sufficient calibration data to verify win rate.
 
 ### Signal expiry
 
@@ -1302,6 +1317,7 @@ All parameters in `config.py`. Key values:
 | `JOB3_MAX_OPEN_TRADES` | `3` | Hard cap on concurrent positions across all pairs |
 | `JOB3_MAX_PORTFOLIO_RISK_PCT` | `3.0` | Max total portfolio risk % before blocking new entry |
 | `JOB3_MAX_CORRELATED_RISK_PCT` | `2.0` | Max risk within one USD-direction bucket |
+| `JOB3_MIN_RR` | `1.0` | Minimum TP/SL ratio — blocks execution below this; also injected into analysis prompt |
 | `JOB3_SIGNAL_EXPIRY_MINUTES` | `60` | Signal validity window |
 | `CONTEXT_MAX_TOKENS` | (config) | Context window budget for analysis LLM |
 | `CONTEXT_DAYS_SUMMARY` | `7` | Days of daily summaries to include |

@@ -56,6 +56,10 @@ signal confidence. A CONFLICTED verdict should result in Wait unless the macro c
 H4 EMA acting as dynamic support/resistance?
 6. STOP LOSS RULE: Never place SL at an obvious level. Pad by at least 1×ATR-14 (D1) beyond \
 the nearest key level. Wider SL in high-volatility regimes.
+7. RISK:REWARD RULE: Only output Long or Short if TP distance >= {min_rr}× SL distance \
+(R:R >= 1:{min_rr}). Use the next significant technical level as TP — do NOT project TP \
+arbitrarily to hit a ratio. If the nearest real TP level does not give R:R >= 1:{min_rr}, \
+output Wait. A structurally sound Wait is better than a negative-edge trade.
 
 {context_window}
 
@@ -109,7 +113,11 @@ def run_full_analysis(context_window: str, symbol: str | None = None) -> dict[st
     sym = symbol or config.MT5_SYMBOL
     display = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["display"]
     system = _SYSTEM_TEMPLATE.format(display=display)
-    prompt = _PROMPT_TEMPLATE.format(display=display, context_window=context_window)
+    prompt = _PROMPT_TEMPLATE.format(
+        display=display,
+        context_window=context_window,
+        min_rr=config.JOB3_MIN_RR,
+    )
 
     try:
         client = _get_client()

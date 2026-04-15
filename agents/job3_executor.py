@@ -130,6 +130,20 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
         if sl_pips < 1:
             sl_pips = config.JOB3_DEFAULT_SL_PIPS
 
+        # ── R:R gate ──────────────────────────────────────────────────────────
+        if tp_price and sl_pips > 0:
+            pip = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
+            tp_pips = abs(tp_price - current_price) / pip
+            rr = tp_pips / sl_pips
+            if rr < config.JOB3_MIN_RR:
+                msg = (
+                    f"R:R {rr:.2f} below minimum {config.JOB3_MIN_RR} "
+                    f"(SL {sl_pips:.1f}p / TP {tp_pips:.1f}p) — signal rejected"
+                )
+                logger.warning(f"[{symbol}] {msg}")
+                return {"ok": False, "error": msg}
+            logger.info(f"[{symbol}] R:R {rr:.2f} — passed minimum {config.JOB3_MIN_RR}")
+
         account_info = _get_equity()
         if account_info is None:
             return {"ok": False, "error": "Cannot read account equity"}
