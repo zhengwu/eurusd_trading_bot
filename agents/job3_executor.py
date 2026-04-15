@@ -34,7 +34,7 @@ load_dotenv()
 import config
 from mt5.connector import connect, disconnect, is_connected
 from mt5.position_reader import get_current_tick, get_open_positions
-from mt5.risk_manager import calculate_lot_size, calculate_sl_tp, sl_pips_from_price, uncertainty_risk_pct
+from mt5.risk_manager import calculate_lot_size, calculate_sl_tp, sl_pips_from_price
 from mt5.order_manager import open_position, close_position, place_limit_order
 from pipeline.signal_store import (
     approve_signal,
@@ -148,14 +148,11 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
         if account_info is None:
             return {"ok": False, "error": "Cannot read account equity"}
 
-        unc = signal.get("uncertainty_score")
-        risk_pct = uncertainty_risk_pct(config.JOB3_RISK_PCT, unc)
-        logger.info(
-            f"Lot sizing: uncertainty={unc} → risk_pct={risk_pct}% "
-            f"(base={config.JOB3_RISK_PCT}%)"
-        )
         lot = signal.get("_lot_override") or calculate_lot_size(
-            account_info, risk_pct, sl_pips, symbol=symbol
+            account_info, config.JOB3_RISK_PCT, sl_pips, symbol=symbol
+        )
+        logger.info(
+            f"[{symbol}] Lot sizing: {'recommended=' + str(signal.get('_lot_override')) if signal.get('_lot_override') else 'fallback (base ' + str(config.JOB3_RISK_PCT) + '%)'} → {lot} lots"
         )
 
         if limit_price:
@@ -275,8 +272,13 @@ def compute_order_preview(signal: dict[str, Any], symbol: str | None = None) -> 
             sl_pips = config.JOB3_DEFAULT_SL_PIPS
 
         equity = _get_equity()
-        lot = calculate_lot_size(equity or 10000.0, config.JOB3_RISK_PCT, sl_pips, symbol=sym)
-        risk_amount = round((equity or 0) * config.JOB3_RISK_PCT / 100, 2)
+        lot_override = signal.get("_lot_override")
+        if lot_override:
+            lot = float(lot_override)
+        else:
+            lot = calculate_lot_size(equity or 10000.0, config.JOB3_RISK_PCT, sl_pips, symbol=sym)
+        risk_pct_used = signal.get("_recommended_risk_pct", config.JOB3_RISK_PCT)
+        risk_amount = round((equity or 0) * risk_pct_used / 100, 2)
 
         tp_pips = abs(tp_price - current_price) / pip if tp_price else None
         rr = round(tp_pips / sl_pips, 2) if tp_pips and sl_pips > 0 else None

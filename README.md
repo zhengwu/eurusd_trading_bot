@@ -37,7 +37,7 @@ A Python-based AI agent that runs 24/5 (while the forex market is open) and does
 
 2. **Watches your open positions.** Every 30 minutes it reads all open MT5 positions across all active pairs and uses Claude Sonnet to recommend whether to Hold, Trim, or Exit each one based on current market conditions.
 
-3. **Executes trades.** When you approve a signal (via Slack or the command line), the agent places or closes the order on MT5 directly. Position sizing is calculated automatically from your account equity and the stop loss distance — scaled by the signal's uncertainty score so high-conviction trades get full size and uncertain trades get reduced size. High-conviction signals (uncertainty ≤ 30) are **auto-executed without manual approval**.
+3. **Executes trades.** When you approve a signal (via Slack or the command line), the agent places or closes the order on MT5 directly. Position sizing is calculated automatically after the ensemble debate: the remaining portfolio risk budget (total cap minus currently deployed risk) is allocated to the new trade, scaled down by the signal's uncertainty score so high-conviction trades get more of the remaining budget and uncertain trades get less. The sizing rationale is shown in the Slack alert. High-conviction signals (uncertainty ≤ 30) are **auto-executed without manual approval**.
 
 You stay in control. The agent never trades without your approval. Signals arrive in Slack with **clickable Execute and Reject buttons** — no typing required. You can also approve at a specific limit price (`approve XXXXXXXX limit 1.0820`), start a pair-specific chat session, and have a full conversation with the agent about market conditions — all from Slack.
 
@@ -85,7 +85,7 @@ Every 30 minutes during market hours it:
    - Drops articles older than `NEWS_MAX_AGE_HOURS` (default 8h) to filter stale delayed articles
    - Filters new articles through a per-pair deduplication cache (shared with the fast watcher)
    - Sends headlines through a two-pass triage system:
-     - **Pass 1** — Azure GPT-5.2 scores all headlines 1–10 with calibrated examples (fallback: Claude Haiku)
+     - **Pass 1** — Azure GPT-5.2 scores all headlines 1–10 with calibrated examples (fallback: Claude Haiku — also triggers on empty/null Azure response)
      - **Pass 2** — Azure GPT-5.2 re-evaluates borderline scores (4–6), pushing them decisively up or down to reduce clustering around 5 (fallback: Claude Haiku)
    - Tags include `cb_decision`, `CB_speech`, `macro_data`, `geopolitical`, `risk_off`, `risk_on`, `other`. CB headlines also carry a `cb_bank` field (`Fed`, `ECB`, `BOE`, or `BOJ`)
 
@@ -119,6 +119,7 @@ Risk Note: Fed speakers at 15:00 UTC could reverse USD weakness
 Order Details (live)
 Entry 1.2743  SL 1.2680 (-63p)  TP 1.2820 (+77p)
 Lot 0.12  Risk $100  R:R 1:1.2
+Sizing: 1.2% of 3.0% portfolio risk in use (1.8% remaining). High conviction (uncertainty=22) → 100% of remaining = 1.8%, capped at 2.0% → 1.8% → 0.12 lots
 
 approve A3F9BC12    |    reject A3F9BC12
 ```
@@ -160,21 +161,29 @@ Job 3 runs when you approve a signal. It routes each signal type to the correct 
 | Job 2 / Job 4 | Trim | Close partial position (default 50%) |
 | Job 4 | SetSL / SetTP / SetSLTP | Modify stop loss / take profit |
 
-For new positions (Long/Short), Job 3 calculates lot size using **uncertainty-scaled risk budgeting**:
+For new positions (Long/Short), lot size is determined by **portfolio-aware uncertainty-scaled risk budgeting**, computed after the ensemble debate (so the uncertainty score is available):
 
-1. **Base risk** — `JOB3_RISK_PCT` (default 2%) of current account equity
-2. **Uncertainty multiplier** — scaled down by the ensemble debate uncertainty score:
+```
+remaining_pct = JOB3_MAX_PORTFOLIO_RISK_PCT − currently_deployed_risk_pct
+allocated_pct = remaining_pct × uncertainty_multiplier
+final_pct     = min(allocated_pct, JOB3_RISK_PCT)   # cap at 2% per trade
+lot           = (equity × final_pct) / (sl_pips × pip_value_per_lot)
+```
 
-| Uncertainty score | Conviction | Risk multiplier | Effective risk (base 2%) |
+| Uncertainty score | Conviction | Multiplier | Example (1.5% remaining) |
 |---|---|---|---|
-| ≤ 30 | High | 1.00× | 2.0% |
-| 31 – 55 | Medium | 0.75× | 1.5% |
-| 56 – 75 | Low (passed veto) | 0.50× | 1.0% |
+| ≤ 30 | High | 1.00× | 1.5% → capped at 2.0% |
+| 31 – 55 | Medium | 0.75× | 1.5% × 0.75 = 1.1% |
+| 56 – 75 | Low (passed veto) | 0.50× | 1.5% × 0.50 = 0.75% |
 | > 75 | — | blocked (vetoed) | — |
 
-Lot = `(equity × effective_risk%) / (sl_pips × pip_value_per_lot)`, clamped to `[JOB3_MIN_LOT, JOB3_MAX_LOT]` (default 0.01 – 5.0). Pip values are pair-aware — USD-quote pairs use $10/pip per standard lot; JPY pairs use the approximate JPY pip value configured in `config.py`.
+Lot is clamped to `[JOB3_MIN_LOT, JOB3_MAX_LOT]` (default 0.01–5.0). Pip values are pair-aware — USD-quote pairs use $10/pip per standard lot; JPY pairs use the approximate JPY pip value from `config.py`. The sizing rationale is shown as an italic line in the Slack order block.
 
-**Minimum R:R gate.** Before placing any order, Job 3 computes `R:R = TP distance / SL distance` from the live prices. If R:R < `JOB3_MIN_RR` (default 1.0), the signal is rejected — even if already approved. The analysis prompt enforces the same threshold upstream so the LLM outputs `Wait` instead of generating unviable setups in the first place.
+If the portfolio risk data is unavailable (e.g. MT5 offline when the signal was generated), Job 3 falls back to flat `JOB3_RISK_PCT` (2%) with no uncertainty scaling. The portfolio risk gate still applies at execution time.
+
+**Minimum R:R gate.** Before placing any order, Job 3 computes `R:R = TP distance / SL distance` from live prices. If R:R < `JOB3_MIN_RR` (default 1.0), the signal is rejected — even if already approved. The analysis prompt enforces the same threshold upstream: the model scans the nearest 2–3 significant structural levels for TP and uses the closest one that meets the R:R requirement. If none do, it outputs `Wait` with `wait_reason=rr_insufficient` logged to Slack and the scanner log.
+
+**Auto-execution.** After sizing, signals with `uncertainty_score ≤ JOB3_AUTO_APPROVE_MAX_UNCERTAINTY` (default 30) are automatically approved and executed in a background thread. Slack receives a confirmation with the MT5 ticket and fill price. Set `JOB3_AUTO_APPROVE_MAX_UNCERTAINTY = None` to require manual approval for all signals.
 
 ### Job 4 — Chat Assistant
 
@@ -256,6 +265,7 @@ Ensemble Debate — Confirmed Long (uncertainty 38/100)
 Order Details (live)
 Entry 1.0820  SL 1.0795 (-25p)  TP 1.0900 (+80p)
 Lot 0.12  Risk $100  R:R 1:3.2
+Sizing: 0.8% of 3.0% portfolio risk in use (2.2% remaining). High conviction (uncertainty=38) → 100% of remaining = 2.2%, capped at 2.0% → 2.0% → 0.12 lots
 
 [ 📈 Execute Long ]  [ ✕ Reject ]
 ```

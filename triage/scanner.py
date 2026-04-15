@@ -290,13 +290,30 @@ def _run_pair_scan(symbol: str) -> list[dict]:
                 try:
                     from analysis.ensemble_agent import run_ensemble_debate
                     run_ensemble_debate(context, signal, symbol=symbol)
-                    # Recompute preview if judge adjusted SL/TP
-                    if signal.get("sl") or signal.get("tp"):
-                        updated_preview = compute_order_preview(signal, symbol=symbol)
-                        if updated_preview:
-                            signal["_order_preview"] = updated_preview
                 except Exception as e:
                     logger.error(f"[{symbol}] Ensemble debate failed: {e}", exc_info=True)
+
+            # Recommend position size based on remaining portfolio risk + uncertainty
+            try:
+                from mt5.risk_manager import recommend_position_size
+                from mt5.position_reader import get_account_summary
+                from mt5.connector import is_connected
+                if is_connected():
+                    acct    = get_account_summary()
+                    equity  = acct.get("equity") or 0.0
+                    sl_pips = (preview or {}).get("sl_pips") or config.JOB3_DEFAULT_SL_PIPS
+                    unc     = signal.get("uncertainty_score") or signal.get("_uncertainty_score")
+                    sizing  = recommend_position_size(unc, equity, sl_pips, symbol=symbol)
+                    signal["_lot_override"]         = sizing["lot"]
+                    signal["_recommended_risk_pct"] = sizing["risk_pct"]
+                    signal["_size_reason"]          = sizing["reason"]
+            except Exception as e:
+                logger.warning(f"[{symbol}] Position sizing recommendation failed (non-fatal): {e}")
+
+            # Recompute preview with recommended lot (and any judge-adjusted SL/TP)
+            updated_preview = compute_order_preview(signal, symbol=symbol)
+            if updated_preview:
+                signal["_order_preview"] = updated_preview
 
             signal_id = save_pending_signal(signal, source="job1")
             signal["_signal_id"] = signal_id
@@ -342,9 +359,11 @@ def _run_pair_scan(symbol: str) -> list[dict]:
                 logger.warning(f"[{symbol}] Outcome tracking (Wait) failed (non-fatal): {e}")
 
         notify(signal, trigger_item=trigger)
+        wait_reason = signal.get("wait_reason", "")
         logger.info(
             f"[{symbol}] Full analysis complete: {signal.get('signal')} "
             f"[{signal.get('confidence')}] {signal.get('time_horizon')}"
+            + (f" | wait_reason={wait_reason}" if wait_reason else "")
         )
 
         # Auto-approve high-conviction Long/Short signals

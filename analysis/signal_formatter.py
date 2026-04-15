@@ -61,5 +61,6 @@ def format_signal(raw: dict[str, Any]) -> dict[str, Any]:
         },
         "today_summary": str(raw.get("today_summary", "")),
         "week_summary":  str(raw.get("week_summary", "")),
+        "wait_reason":   str(raw.get("wait_reason", "")),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

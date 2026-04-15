@@ -293,10 +293,13 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
         rr      = order_preview.get("risk_reward", "—")
         live    = " _(live)_" if order_preview.get("live_price") else " _(estimated)_"
         rr_warn = "  :warning: _R:R below 1.5_" if order_preview.get("rr_warning") else ""
+        size_reason = signal.get("_size_reason", "")
+        size_line   = f"\n>_Sizing: {size_reason}_" if size_reason else ""
         order_line = (
             f"\n\n*Order Details*{live}\n"
             f">Entry `{entry}`  SL `{sl}` (-{sl_p}p)  TP `{tp}` (+{tp_p}p)\n"
             f">Lot `{lot}`  Risk `${risk}`  R:R `{rr}`{rr_warn}"
+            f"{size_line}"
         )
 
     # Ensemble debate block

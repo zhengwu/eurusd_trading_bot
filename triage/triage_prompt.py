@@ -174,7 +174,11 @@ def _call_azure(system: str, prompt: str) -> str:
         max_completion_tokens=1024,
         temperature=0.1,
     )
-    return resp.choices[0].message.content.strip()
+    content = resp.choices[0].message.content
+    if not content:
+        finish = resp.choices[0].finish_reason
+        raise RuntimeError(f"Azure returned empty content (finish_reason={finish})")
+    return content.strip()
 
 
 def _parse_json_array(raw: str) -> list[dict]:

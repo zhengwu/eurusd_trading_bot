@@ -57,8 +57,11 @@ H4 EMA acting as dynamic support/resistance?
 6. STOP LOSS RULE: Never place SL at an obvious level. Pad by at least 1×ATR-14 (D1) beyond \
 the nearest key level. Wider SL in high-volatility regimes.
 7. RISK:REWARD RULE: Only output Long or Short if TP distance >= {min_rr}× SL distance \
-(R:R >= 1:{min_rr}). Use the next significant technical level as TP — do NOT project TP \
-arbitrarily to hit a ratio. If the nearest real TP level does not give R:R >= 1:{min_rr}, \
+(R:R >= 1:{min_rr}). Scan the nearest 2-3 significant technical levels ahead of price \
+(swing highs/lows, SMAs, Bollinger midline, round numbers, prev day H/L) and use the closest \
+one that satisfies the R:R requirement. Do NOT invent levels or project TP arbitrarily — every \
+TP must correspond to a named structure visible in the price data. If no meaningful level within \
+a reasonable range (i.e., within 2× ATR-14 of the entry) satisfies R:R >= 1:{min_rr}, \
 output Wait. A structurally sound Wait is better than a negative-edge trade.
 
 {context_window}
@@ -76,6 +79,7 @@ verdict (ALIGNED / LEANING / CONFLICTED). Explain how this shapes your bias and 
 position (extended or mid-range?), H4 EMA support/resistance, key levels. Where is the liquidity? \
 What structure are you trading? Why is this setup high-probability given the confluence?",
   "signal": "Long | Short | Wait",
+  "wait_reason": "ONLY populate if signal=Wait. Primary reason: 'rr_insufficient' (no structural TP level within 2×ATR gives R:R >= 1:{min_rr}), 'mtf_conflicted' (D1/H4/M15 alignment is CONFLICTED), 'macro_unclear' (no clear directional catalyst), or 'risk_event_pending' (high-impact event imminent). Include a 1-sentence explanation. Leave empty string for Long/Short.",
   "confidence": "High | Medium | Low",
   "time_horizon": "Intraday | 1-3 days | This week",
   "trade_setup": {{

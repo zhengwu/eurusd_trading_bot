@@ -1,6 +1,6 @@
 # Technical Report: Forex Multi-Pair AI Trading Agent
 
-**Version:** April 2026 (updated 2026-04-14)  
+**Version:** April 2026 (updated 2026-04-15)  
 **Pairs:** EUR/USD · GBP/USD · USD/JPY  
 **Platform:** Windows / MetaTrader 5 / Python 3.11
 
@@ -15,13 +15,14 @@
 5. [Pipeline 3 — Context Assembly](#5-pipeline-3--context-assembly)
 6. [Pipeline 4 — Full Analysis & Signal Generation](#6-pipeline-4--full-analysis--signal-generation)
 7. [Pipeline 5 — Multi-Agent Ensemble Debate](#7-pipeline-5--multi-agent-ensemble-debate)
-8. [Pipeline 6 — Position Monitor](#8-pipeline-6--position-monitor)
-9. [Pipeline 7 — Pre-Event Analysis](#9-pipeline-7--pre-event-analysis)
-10. [Pipeline 8 — Trade Execution](#10-pipeline-8--trade-execution)
-11. [Supporting Systems](#11-supporting-systems)
-12. [LLM Model Assignments](#12-llm-model-assignments)
-13. [Configuration Reference](#13-configuration-reference)
-14. [Design Decisions](#14-design-decisions)
+8. [Pipeline 6 — Position Sizing & Order Parameters](#8-pipeline-6--position-sizing--order-parameters)
+9. [Pipeline 7 — Position Monitor](#9-pipeline-7--position-monitor)
+10. [Pipeline 8 — Pre-Event Analysis](#10-pipeline-8--pre-event-analysis)
+11. [Pipeline 9 — Trade Execution](#11-pipeline-9--trade-execution)
+12. [Supporting Systems](#12-supporting-systems)
+13. [LLM Model Assignments](#13-llm-model-assignments)
+14. [Configuration Reference](#14-configuration-reference)
+15. [Design Decisions](#15-design-decisions)
 
 ---
 
@@ -371,6 +372,8 @@ Pass 2: Azure GPT-5.2
   → on failure: Claude Haiku (config.TRIAGE_MODEL)
 ```
 
+"Failure" includes both API exceptions and empty/null response content. Azure GPT-5.2 can return a 200 OK with `choices[0].message.content = None` (e.g. content filter refusal). `_call_azure()` now explicitly checks for empty content and raises `RuntimeError(f"Azure returned empty content (finish_reason={...})")` so the Haiku fallback is correctly triggered rather than passing an empty string to `json.loads()`.
+
 ### Output
 
 Every article receives a triage record regardless of score. All records are appended to `data/YYYY-MM-DD/intraday.jsonl`:
@@ -528,6 +531,12 @@ ANALYTICAL PROCESS — follow this order:
 5. ENTRY PRECISION: Use H4 EMA 20/50 and M15 structure for entry zone.
 6. STOP LOSS RULE: Never place SL at an obvious level. Pad by at least 1×ATR-14 (D1) beyond
    the nearest key level. Wider SL in high-volatility regimes.
+7. RISK:REWARD RULE: Only output Long or Short if TP distance >= {min_rr}× SL distance
+   (R:R >= 1:{min_rr}). Scan the nearest 2-3 significant technical levels ahead of price
+   (swing highs/lows, SMAs, Bollinger midline, round numbers, prev day H/L) and use the closest
+   one that satisfies the R:R requirement. Do NOT invent levels — every TP must correspond to a
+   named structure visible in the price data. If no meaningful level within 2× ATR-14 satisfies
+   R:R >= 1:{min_rr}, output Wait.
 
 {context_window}
 
@@ -540,6 +549,7 @@ complete the analytical fields first to build your thesis, THEN output the signa
   "mtf_confluence": "D1/H4/M15 trend directions and ALIGNED/LEANING/CONFLICTED verdict",
   "technical_rationale": "Full TA picture: MTF structure, MACD, Bollinger, H4 EMA, key levels",
   "signal": "Long | Short | Wait",
+  "wait_reason": "ONLY populate if signal=Wait. Primary reason: 'rr_insufficient', 'mtf_conflicted', 'macro_unclear', or 'risk_event_pending'. Include a 1-sentence explanation. Empty string for Long/Short.",
   "confidence": "High | Medium | Low",
   "time_horizon": "Intraday | 1-3 days | This week",
   "trade_setup": {
@@ -568,11 +578,13 @@ complete the analytical fields first to build your thesis, THEN output the signa
 Return ONLY valid JSON, no other text.
 ```
 
+**`wait_reason` field:** When the signal is `Wait`, the model must identify the primary reason using one of four categories: `rr_insufficient` (no structural TP level within 2×ATR satisfies the R:R threshold), `mtf_conflicted` (D1/H4/M15 alignment verdict is CONFLICTED), `macro_unclear` (no clear directional catalyst), or `risk_event_pending` (high-impact event imminent). This field is passed through `signal_formatter.py` and logged by the scanner — enabling ongoing diagnosis of why setups are being filtered without changing any thresholds.
+
 ### Signal output
 
-The signal formatter (`analysis/signal_formatter.py`) normalises the raw JSON into a standardised dict with fields: `signal`, `confidence`, `time_horizon`, `rationale`, `support`, `resistance`, `sl`, `tp`, `invalidation`, `risk_note`, etc.
+The signal formatter (`analysis/signal_formatter.py`) normalises the raw JSON into a standardised dict with fields: `signal`, `confidence`, `time_horizon`, `today_summary`, `key_levels`, `price_snapshot`, `invalidation`, `risk_note`, `wait_reason`, etc.
 
-Only `Long` and `Short` signals proceed to the ensemble debate and order preview. `Wait` signals are notified to Slack and logged, but no order is placed.
+Only `Long` and `Short` signals proceed to the ensemble debate and order preview. `Wait` signals are notified to Slack and logged with their `wait_reason`. The scanner appends `wait_reason` to the info log line (e.g. `Full analysis complete: Wait [Medium] Intraday | wait_reason=rr_insufficient — ...`) for ongoing signal quality diagnosis.
 
 ---
 
@@ -828,7 +840,95 @@ The three persona calls run concurrently via `asyncio.gather` using `openai.Asyn
 
 ---
 
-## 8. Pipeline 6 — Position Monitor (Dynamic Position Management)
+## 8. Pipeline 6 — Position Sizing & Order Parameters
+
+**Files:** `mt5/risk_manager.py`, `agents/job3_executor.py`  
+**Triggered by:** Any `Long` or `Short` signal that survives the ensemble debate
+
+At this point in the pipeline, the signal has a confirmed direction, LLM-proposed SL/TP (potentially adjusted by the debate judge), and an `uncertainty_score`. This section describes how those raw values are turned into a fully-specified order: final SL/TP prices, lot size, and the order preview shown in Slack.
+
+### SL and TP derivation
+
+SL and TP prices are derived in `calculate_sl_tp()` (`mt5/risk_manager.py`) from the signal's `key_levels` dict:
+
+| Direction | SL source | TP source |
+|-----------|-----------|-----------|
+| Long (buy) | `key_levels.support` | `key_levels.resistance` |
+| Short (sell) | `key_levels.resistance` | `key_levels.support` |
+
+If the debate judge suggested adjusted SL or TP values, those are written onto the signal before this step and take priority. If `key_levels` are missing entirely, fixed pip fallbacks apply: `JOB3_DEFAULT_SL_PIPS` (30) and `JOB3_DEFAULT_TP_PIPS` (60).
+
+### Lot size — `recommend_position_size()`
+
+Lot size is computed by `recommend_position_size()` in `mt5/risk_manager.py`. It runs after the debate so the `uncertainty_score` is available, and before the signal is saved to the pending store.
+
+**Formula:**
+
+```
+remaining_pct = JOB3_MAX_PORTFOLIO_RISK_PCT − current_portfolio_risk_pct
+allocated_pct = remaining_pct × uncertainty_multiplier
+final_pct     = min(allocated_pct, JOB3_RISK_PCT)     # cap at per-trade base limit
+lot_size      = (equity × final_pct) / (sl_pips × pip_value_per_lot)
+lot_size      = clamp(lot_size, JOB3_MIN_LOT, JOB3_MAX_LOT)
+```
+
+The key design principle: lot size is allocated from the **remaining portfolio risk budget**, scaled by conviction. A high-conviction signal on an account that is already 2.5% deployed gets less capital than the same signal on a fresh account.
+
+**Uncertainty multiplier tiers** (from `JOB3_UNCERTAINTY_TIERS`):
+
+| Uncertainty score | Conviction | Multiplier | Example (1.5% remaining) |
+|-------------------|------------|------------|--------------------------|
+| ≤ 30 | High | 1.00× | 1.5% → capped at 2.0% base |
+| 31–55 | Medium | 0.75× | 1.5% × 0.75 = 1.1% |
+| 56–75 | Low (passed veto) | 0.50× | 1.5% × 0.50 = 0.75% |
+| None (no debate) | — | fallback | flat `JOB3_RISK_PCT` (2.0%) |
+
+**Pip values** are pair-aware:
+- USD-quote pairs (EURUSD, GBPUSD): $10 per pip per standard lot
+- JPY pairs (USDJPY): approximate JPY pip value from config
+
+**Fallback behaviour:** If MT5 is disconnected when sizing runs (portfolio data unavailable), `execute_signal()` falls back to `calculate_lot_size(equity, JOB3_RISK_PCT, sl_pips)` — flat base risk, no uncertainty scaling. The portfolio risk gate still applies at execution time.
+
+The result is attached to the signal as `_lot_override` (lot) and `_size_reason` (human-readable rationale). `execute_signal()` reads `_lot_override` directly; the `uncertainty_risk_pct()` scaling that previously ran at execution time has been removed — uncertainty is now fully captured here.
+
+### Order preview
+
+`compute_order_preview()` (`agents/job3_executor.py`) assembles the full order picture using live MT5 tick data (or key-level midpoint if MT5 is offline):
+
+| Field | Source |
+|-------|--------|
+| `entry_price` | Live ask (buy) or bid (sell) |
+| `sl` / `tp` | From `calculate_sl_tp()` |
+| `sl_pips` / `tp_pips` | Distance from entry in pips |
+| `lot_size` | `_lot_override` if set, else `calculate_lot_size(base_risk)` |
+| `risk_amount` | `equity × _recommended_risk_pct` (or `JOB3_RISK_PCT`) |
+| `risk_reward` | `tp_pips / sl_pips` |
+| `rr_warning` | `True` when R:R < 1.5 |
+
+The preview is stored on the signal as `_order_preview` and rendered in the Slack notification. The sizing rationale appears as an italic line beneath the lot/risk line:
+
+```
+Order Details (live)
+>Entry 1.0851  SL 1.0821 (-30p)  TP 1.0951 (+100p)
+>Lot 0.05  Risk $75  R:R 1:3.3
+>Sizing: 1.2% of 3.0% portfolio risk in use (1.8% remaining). Medium conviction (uncertainty=48) → 75% of remaining = 1.4%, capped at 2.0% → 1.4% → 0.05 lots
+```
+
+### Auto-execution for high-conviction signals
+
+After the signal is saved and the Slack notification is sent, the scanner checks `uncertainty_score` against `JOB3_AUTO_APPROVE_MAX_UNCERTAINTY` (default: 30). If the score is at or below this threshold — meaning the debate judged the signal as high conviction — the signal is **automatically approved and executed** in a background thread without waiting for a human button click.
+
+| Uncertainty score | Action |
+|---|---|
+| ≤ 30 (`JOB3_AUTO_APPROVE_MAX_UNCERTAINTY`) | Auto-approved and executed; Slack notified with ticket and fill price |
+| 31–75 | Sent to Slack for manual approval via Execute / Reject buttons |
+| > 75 (`DEBATE_MAX_UNCERTAINTY`) | Vetoed by debate; downgraded to Wait; never saved |
+
+Set `JOB3_AUTO_APPROVE_MAX_UNCERTAINTY = None` in `config.py` to disable auto-execution entirely and require manual approval for all signals.
+
+---
+
+## 9. Pipeline 7 — Position Monitor (Dynamic Position Management)
 
 **File:** `agents/job2_position.py`  
 **Model:** Claude Sonnet (`claude-sonnet-4-6`)  
@@ -965,7 +1065,7 @@ The LLM returns:
 
 ---
 
-## 9. Pipeline 7 — Pre-Event Analysis
+## 10. Pipeline 8 — Pre-Event Analysis
 
 **File:** `pipeline/pre_event_agent.py`  
 **Models:** Claude Sonnet (pre-event brief), full analysis pipeline (post-event trigger)
@@ -1021,7 +1121,7 @@ Both briefs and triggers are deduplicated per event per day via `data/.pre_event
 
 ---
 
-## 10. Pipeline 8 — Trade Execution
+## 11. Pipeline 9 — Trade Execution
 
 **File:** `agents/job3_executor.py`  
 **Triggered by:** User approval (`approve <ID>` in Slack or CLI)
@@ -1049,17 +1149,9 @@ Risk per open position is estimated as `sl_pips × lot × pip_value_per_lot`. If
 
 On every successful execution, `approve_and_execute()` writes `{ticket: signal_id}` to `data/ticket_map.json`. This lets Job 2 reverse-lookup the original signal for any open position — providing the original thesis, time horizon, key levels, and invalidation condition to the LLM without storing redundant data in the position itself.
 
-### Lot size calculation
+### Lot size
 
-Lot size is computed in `mt5/risk_manager.py` to risk exactly `JOB3_RISK_PCT` (default 1%) of current account equity:
-
-```
-lot_size = (equity × risk_pct) / (sl_pips × pip_value_per_lot)
-```
-
-Pip values are pair-aware:
-- USD-quote pairs (EURUSD, GBPUSD): $10 per pip per standard lot
-- JPY pairs (USDJPY): approximate JPY pip value from config
+See [§8 Pipeline 6 — Position Sizing & Order Parameters](#8-pipeline-6--position-sizing--order-parameters). Lot size arrives at execution time as `signal["_lot_override"]`, pre-computed by `recommend_position_size()` after the debate. `execute_signal()` uses it directly. If absent (fallback path), `calculate_lot_size(equity, JOB3_RISK_PCT, sl_pips)` is used.
 
 ### Order routing
 
@@ -1102,7 +1194,7 @@ if rr < config.JOB3_MIN_RR:
     return {"ok": False, "error": f"R:R {rr:.2f} below minimum {config.JOB3_MIN_RR} — signal rejected"}
 ```
 
-This is a backstop — it fires even if a user manually approves a signal from Slack. The upstream analysis prompt also enforces the same threshold as a generation-time constraint: rule 7 in `_PROMPT_TEMPLATE` instructs the LLM to output `Wait` instead of a directional signal when the nearest real technical TP level does not give R:R ≥ `JOB3_MIN_RR`. Both the prompt rule and the execution gate read from `config.JOB3_MIN_RR` so changing the value in one place applies everywhere.
+This is a backstop — it fires even if a user manually approves a signal from Slack. The upstream analysis prompt also enforces the same threshold as a generation-time constraint: rule 7 in `_PROMPT_TEMPLATE` instructs the LLM to scan the nearest 2-3 significant technical levels (swing highs/lows, SMAs, Bollinger midline, round numbers, prev day H/L) and use the closest one that satisfies R:R ≥ `JOB3_MIN_RR`. If no structural level within 2× ATR-14 satisfies the threshold, the model outputs `Wait` with `wait_reason=rr_insufficient`. Both the prompt rule and the execution gate read from `config.JOB3_MIN_RR` so changing the value applies everywhere.
 
 **Why 1.0 as the floor:** A ratio below 1.0 means TP is closer than SL — every winning trade is smaller than every losing trade. The strategy requires a win rate above 50% just to break even, with no margin for slippage or spread. 1.0 is the minimum viable edge. Raise to 1.2–1.5 once `outcome_log.json` has sufficient calibration data to verify win rate.
 
@@ -1139,7 +1231,7 @@ The original signal analysis above the buttons is preserved — only the action 
 
 ---
 
-## 11. Supporting Systems
+## 12. Supporting Systems
 
 ### Central bank policy auto-updater
 
@@ -1260,7 +1352,7 @@ class _SafeRotatingFileHandler(RotatingFileHandler):
 
 ---
 
-## 12. LLM Model Assignments
+## 13. LLM Model Assignments
 
 | Task | File | Model | Rationale |
 |------|------|-------|-----------|
@@ -1280,7 +1372,7 @@ class _SafeRotatingFileHandler(RotatingFileHandler):
 
 ---
 
-## 13. Configuration Reference
+## 14. Configuration Reference
 
 All parameters in `config.py`. Key values:
 
@@ -1310,9 +1402,9 @@ All parameters in `config.py`. Key values:
 | `JOB2_AUTO_TRAIL` | `True` | Auto-execute trail SL updates without approval |
 | `JOB2_PHASE_WATCH_INTERVAL_SEC` | `60` | How often the phase watcher polls MT5 ticks |
 | `JOB2_PHASE_WATCH_COOLDOWN_SEC` | `300` | Min seconds between watcher-triggered analyses per ticket |
-| `JOB3_RISK_PCT` | `2.0` | Base % of equity risked per trade — scaled down by `JOB3_UNCERTAINTY_TIERS` |
+| `JOB3_RISK_PCT` | `2.0` | Per-trade risk cap (% of equity). `recommend_position_size()` allocates from the remaining portfolio budget and caps the result at this value. Used as flat fallback when portfolio data is unavailable. |
 | `JOB3_MAX_LOT` | `5.0` | Maximum lot size cap |
-| `JOB3_UNCERTAINTY_TIERS` | see config | Tiered risk multipliers by uncertainty: ≤30→100%, ≤55→75%, ≤75→50% |
+| `JOB3_UNCERTAINTY_TIERS` | see config | Multipliers applied to remaining portfolio risk budget: ≤30→100%, ≤55→75%, ≤75→50% |
 | `JOB3_AUTO_APPROVE_MAX_UNCERTAINTY` | `30` | Auto-execute without approval when uncertainty ≤ this. `None` disables. |
 | `JOB3_MAX_OPEN_TRADES` | `3` | Hard cap on concurrent positions across all pairs |
 | `JOB3_MAX_PORTFOLIO_RISK_PCT` | `3.0` | Max total portfolio risk % before blocking new entry |
@@ -1332,7 +1424,7 @@ All parameters in `config.py`. Key values:
 
 ---
 
-## 14. Design Decisions
+## 15. Design Decisions
 
 ### Why human approval is required
 

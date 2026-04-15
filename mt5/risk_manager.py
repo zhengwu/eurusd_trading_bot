@@ -49,6 +49,96 @@ def uncertainty_risk_pct(base_pct: float, uncertainty: int | float | None) -> fl
     return round(base_pct * 0.50, 4)
 
 
+def recommend_position_size(
+    uncertainty: int | float | None,
+    equity: float,
+    sl_pips: float,
+    symbol: str | None = None,
+) -> dict:
+    """
+    Compute recommended lot size based on remaining portfolio risk budget
+    and the signal's uncertainty score.
+
+    Logic:
+      remaining_pct = JOB3_MAX_PORTFOLIO_RISK_PCT - currently_used_pct
+      allocated_pct = remaining_pct × uncertainty_multiplier
+      final_pct     = min(allocated_pct, JOB3_RISK_PCT)   # cap at base per-trade limit
+      lot           = calculate_lot_size(equity, final_pct, sl_pips, symbol)
+
+    Falls back to JOB3_RISK_PCT flat when uncertainty is None (no debate ran)
+    or when portfolio data is unavailable.
+
+    Returns:
+      {
+        "risk_pct":  float,   # effective risk % used for lot sizing
+        "lot":       float,   # recommended lot size
+        "reason":    str,     # human-readable sizing rationale
+      }
+    """
+    sym = symbol or config.MT5_SYMBOL
+
+    # ── Get portfolio risk already in use ─────────────────────────────────────
+    used_pct = 0.0
+    max_pct  = config.JOB3_MAX_PORTFOLIO_RISK_PCT
+    try:
+        from mt5.portfolio_risk import get_portfolio_summary
+        summary  = get_portfolio_summary(equity)
+        used_pct = summary.get("total_risk_pct", 0.0)
+    except Exception as e:
+        logger.warning(f"recommend_position_size: portfolio summary unavailable ({e}), using base risk")
+        lot = calculate_lot_size(equity, config.JOB3_RISK_PCT, sl_pips, sym)
+        return {
+            "risk_pct": config.JOB3_RISK_PCT,
+            "lot":      lot,
+            "reason":   f"Portfolio data unavailable — using base {config.JOB3_RISK_PCT}% → {lot} lots",
+        }
+
+    remaining_pct = max(0.0, round(max_pct - used_pct, 4))
+
+    # ── No debate ran — fall back to flat base risk ───────────────────────────
+    if uncertainty is None:
+        lot = calculate_lot_size(equity, config.JOB3_RISK_PCT, sl_pips, sym)
+        return {
+            "risk_pct": config.JOB3_RISK_PCT,
+            "lot":      lot,
+            "reason":   (
+                f"No debate data — base {config.JOB3_RISK_PCT}% risk "
+                f"({used_pct:.1f}% of {max_pct:.1f}% cap in use) → {lot} lots"
+            ),
+        }
+
+    # ── Resolve uncertainty multiplier and conviction label ───────────────────
+    multiplier   = 0.50   # default (beyond all tiers — should be vetoed)
+    conviction   = "Very low"
+    for threshold, mult in sorted(config.JOB3_UNCERTAINTY_TIERS, key=lambda t: t[0]):
+        if uncertainty <= threshold:
+            multiplier = mult
+            if threshold <= 30:
+                conviction = "High"
+            elif threshold <= 55:
+                conviction = "Medium"
+            else:
+                conviction = "Low"
+            break
+
+    # ── Compute final risk % ──────────────────────────────────────────────────
+    allocated_pct = round(remaining_pct * multiplier, 4)
+    final_pct     = round(min(allocated_pct, config.JOB3_RISK_PCT), 4)
+
+    lot = calculate_lot_size(equity, final_pct, sl_pips, sym)
+
+    reason = (
+        f"{used_pct:.1f}% of {max_pct:.1f}% portfolio risk in use "
+        f"({remaining_pct:.1f}% remaining). "
+        f"{conviction} conviction (uncertainty={uncertainty}) "
+        f"→ {multiplier:.0%} of remaining = {allocated_pct:.1f}%, "
+        f"capped at {config.JOB3_RISK_PCT:.1f}% → {final_pct:.1f}% → {lot} lots"
+    )
+    logger.info(f"[{sym}] recommend_position_size: {reason}")
+
+    return {"risk_pct": final_pct, "lot": lot, "reason": reason}
+
+
 def calculate_lot_size(equity: float, risk_pct: float, sl_pips: float, symbol: str | None = None) -> float:
     """
     Calculate position size based on account equity and SL distance.
