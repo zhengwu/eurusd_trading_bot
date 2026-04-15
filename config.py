@@ -136,11 +136,12 @@ MT5_MAGIC_NUMBER = 20260314      # Identifies orders placed by this agent
 #
 PAIRS: dict[str, dict] = {
     "EURUSD": {
-        "display":           "EUR/USD",
-        "yf_ticker":         "EURUSD=X",
-        "pip":               0.0001,
-        "pip_value_per_lot": 10.0,
-        "price_decimals":    5,
+        "display":            "EUR/USD",
+        "yf_ticker":          "EURUSD=X",
+        "pip":                0.0001,
+        "pip_value_per_lot":  10.0,
+        "price_decimals":     5,
+        "normal_spread_pips": 1.0,   # typical spread in quiet market hours
         "correlations": [
             ("DXY",    "DX-Y.NYB",   "",  "Inverse — DXY up = EUR/USD down"),
             ("Gold",   "GC=F",   "",  "Risk-on proxy — Gold up = mild EUR support"),
@@ -150,11 +151,12 @@ PAIRS: dict[str, dict] = {
         ],
     },
     "GBPUSD": {
-        "display":           "GBP/USD",
-        "yf_ticker":         "GBPUSD=X",
-        "pip":               0.0001,
-        "pip_value_per_lot": 10.0,
-        "price_decimals":    5,
+        "display":            "GBP/USD",
+        "yf_ticker":          "GBPUSD=X",
+        "pip":                0.0001,
+        "pip_value_per_lot":  10.0,
+        "price_decimals":     5,
+        "normal_spread_pips": 1.5,
         "correlations": [
             ("DXY",    "DX-Y.NYB",    "",  "Inverse — DXY up = GBP/USD down"),
             ("FTSE",   "^FTSE",   "",  "UK equities — FTSE up = GBP support"),
@@ -164,11 +166,12 @@ PAIRS: dict[str, dict] = {
         ],
     },
     "USDJPY": {
-        "display":           "USD/JPY",
-        "yf_ticker":         "USDJPY=X",
-        "pip":               0.01,
-        "pip_value_per_lot": 6.7,    # ~100,000 * 0.01 / 150 — update if rate moves far
-        "price_decimals":    3,
+        "display":            "USD/JPY",
+        "yf_ticker":          "USDJPY=X",
+        "pip":                0.01,
+        "pip_value_per_lot":  6.7,    # ~100,000 * 0.01 / 150 — update if rate moves far
+        "price_decimals":     3,
+        "normal_spread_pips": 1.0,
         "correlations": [
             ("Nikkei", "^N225",  "",  "Japan equities — Nikkei up = JPY weakness"),
             ("US10Y",  "^TNX",   "%", "Yield — rising = USD/JPY up (carry trade)"),
@@ -178,11 +181,12 @@ PAIRS: dict[str, dict] = {
         ],
     },
     "AUDUSD": {
-        "display":           "AUD/USD",
-        "yf_ticker":         "AUDUSD=X",
-        "pip":               0.0001,
-        "pip_value_per_lot": 10.0,
-        "price_decimals":    5,
+        "display":            "AUD/USD",
+        "yf_ticker":          "AUDUSD=X",
+        "pip":                0.0001,
+        "pip_value_per_lot":  10.0,
+        "price_decimals":     5,
+        "normal_spread_pips": 1.5,
         "correlations": [
             ("Iron Ore", "VALE",  "",  "Iron ore proxy — Vale up = AUD support"),
             ("Gold",     "GC=F",  "",  "Commodity — Gold up = AUD support"),
@@ -208,15 +212,56 @@ def get_pair(symbol: str) -> dict:
 
 
 # ── Job 2 — Position Monitor ──────────────────────────────────────────────────
-JOB2_CHECK_INTERVAL_MINUTES = 30  # How often Job 2 checks open positions
+JOB2_CHECK_INTERVAL_MINUTES  = 30    # How often Job 2 checks open positions
+
+# Phase engine thresholds (R-multiples relative to original SL distance)
+JOB2_LOSS_DEEP_R             = -0.5  # Below this → LOSS_DEEP (approaching SL, urgent review)
+                                     # Between this and 0 → LOSS_MILD (normal noise range)
+JOB2_BREAKEVEN_R             = 1.0   # Move SL to breakeven when trade reaches this R
+JOB2_BREAKEVEN_BUFFER_PIPS   = 3     # Set breakeven SL this many pips beyond entry (not at exact entry)
+JOB2_PARTIAL_TP_R            = 1.5   # Suggest partial trim when trade reaches this R
+JOB2_PARTIAL_TP_PCT          = 50.0  # Default trim size at partial TP (% of position)
+JOB2_TRAIL_R                 = 2.0   # Start ATR-based trailing when trade reaches this R
+JOB2_TRAIL_ATR_MULT          = 1.5   # Trail SL at this multiple of M15 ATR behind price
+JOB2_OVERDUE_MULT            = 1.5   # Flag position overdue if open > N × expected horizon hours
+
+# Operational safeguards
+JOB2_MAX_SPREAD_MULT         = 2.0   # Skip SL/TP modifications if spread > N × normal_spread_pips
+JOB2_NEWS_BLACKOUT_MIN       = 15    # Pause modifications if high-impact event is < N minutes away
+JOB2_AUTO_BREAKEVEN          = True  # Auto-execute breakeven SL move without approval
+JOB2_AUTO_TRAIL              = True  # Auto-execute trailing SL updates without approval
+
+# Phase threshold watcher (lightweight tick-polling between the 30-min main loop)
+JOB2_PHASE_WATCH_INTERVAL_SEC = 60   # How often the watcher polls MT5 ticks
+JOB2_PHASE_WATCH_COOLDOWN_SEC = 300  # Min seconds between watcher-triggered analyses per position
 
 # ── Job 3 — Trade Executor ────────────────────────────────────────────────────
-JOB3_RISK_PCT = 1.0              # % of account equity to risk per trade
-JOB3_MIN_LOT = 0.01              # Minimum lot size
-JOB3_MAX_LOT = 1.0               # Maximum lot size
-JOB3_DEFAULT_SL_PIPS = 30        # Fallback SL if key_levels missing
-JOB3_DEFAULT_TP_PIPS = 60        # Fallback TP if key_levels missing
-JOB3_SIGNAL_EXPIRY_MINUTES = 60  # Signal auto-expires if not approved in time
+JOB3_RISK_PCT                = 2.0   # % of account equity to risk per trade (base; scaled down by uncertainty)
+JOB3_MIN_LOT                 = 0.01  # Minimum lot size
+JOB3_MAX_LOT                 = 5.0   # Maximum lot size
+JOB3_DEFAULT_SL_PIPS         = 30    # Fallback SL if key_levels missing
+JOB3_DEFAULT_TP_PIPS         = 60    # Fallback TP if key_levels missing
+JOB3_SIGNAL_EXPIRY_MINUTES   = 60    # Signal auto-expires if not approved in time
+
+# Uncertainty-based lot sizing — risk % multipliers by uncertainty tier
+# uncertainty <= 30  → 1.00× (high conviction — full risk)
+# uncertainty <= 55  → 0.75× (medium conviction)
+# uncertainty <= 75  → 0.50× (low conviction — passed veto but sized down)
+# uncertainty >  75  → blocked by DEBATE_MAX_UNCERTAINTY veto before reaching here
+JOB3_UNCERTAINTY_TIERS: list[tuple[int, float]] = [
+    (30, 1.00),
+    (55, 0.75),
+    (75, 0.50),
+]
+
+# Auto-approve and execute signals without human approval when uncertainty is at
+# or below this threshold. Set to None to disable (all signals require approval).
+JOB3_AUTO_APPROVE_MAX_UNCERTAINTY: int | None = 30
+
+# Portfolio-level risk limits (applied before opening any new Long/Short)
+JOB3_MAX_OPEN_TRADES         = 3     # Hard cap on concurrent positions across all pairs
+JOB3_MAX_PORTFOLIO_RISK_PCT  = 3.0   # Max total risk (open positions + new trade) as % of equity
+JOB3_MAX_CORRELATED_RISK_PCT = 2.0   # Max risk within same USD-direction bucket (usd_long/usd_short)
 
 # ── Price assets to track (legacy — superseded by PAIRS[symbol]["correlations"]) ──
 PRICE_ASSETS = {

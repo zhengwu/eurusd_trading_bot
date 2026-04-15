@@ -160,12 +160,19 @@ def record_signal(
                 "price":     None,
                 "pip_move":  None,   # positive = price moved in signal direction
                 "direction": None,   # "with" | "against" | "flat"
-                "sl_hit":    None,
-                "tp_hit":    None,
                 "checked_at": None,
             }
             for h in _CHECKPOINTS_HOURS
         },
+
+        # Bar-replay exit — which level was hit first within the 48h window
+        # Only populated for Long/Short signals; null for Wait.
+        "first_exit":         None,   # "sl" | "tp" | "open" | null
+        "first_exit_time":    None,   # ISO bar open time when hit
+        "first_exit_price":   None,   # the SL or TP price level touched
+        "first_exit_pips":    None,   # pip P&L vs entry_price (negative = loss)
+        "first_exit_checked": False,  # True once the replay has run to completion
+
         "outcome_status": "pending",   # pending | partial | complete
     }
 
@@ -248,26 +255,6 @@ def _check_pending_outcomes() -> None:
                     checkpoint["pip_move"]  = pip_move
                     checkpoint["direction"] = "flat"
 
-                # Check SL/TP hit (approximate — we only have discrete samples)
-                sl = record.get("sl")
-                tp = record.get("tp")
-                if sl is not None:
-                    try:
-                        checkpoint["sl_hit"] = (
-                            price <= float(sl) if direction == "Long"
-                            else price >= float(sl)
-                        )
-                    except (TypeError, ValueError):
-                        pass
-                if tp is not None:
-                    try:
-                        checkpoint["tp_hit"] = (
-                            price >= float(tp) if direction == "Long"
-                            else price <= float(tp)
-                        )
-                    except (TypeError, ValueError):
-                        pass
-
             any_filled = True
             logger.info(
                 f"outcome_tracker: {record['signal_id']} [{symbol}] "
@@ -276,6 +263,57 @@ def _check_pending_outcomes() -> None:
 
         if any_filled:
             updated += 1
+
+        # ── Bar-replay: find which level was hit first ─────────────────────
+        # Run once for directional signals after the 48h window has fully elapsed
+        # (or at any point once a result is definitive — sl/tp — since it won't change).
+        if (
+            direction in ("Long", "Short")
+            and not record.get("first_exit_checked")
+            and (record.get("sl") is not None or record.get("tp") is not None)
+        ):
+            created_at = record.get("created_at")
+            if created_at:
+                try:
+                    from_dt = datetime.fromisoformat(created_at)
+                    if from_dt.tzinfo is None:
+                        from_dt = from_dt.replace(tzinfo=timezone.utc)
+
+                    # Only attempt if at least one M15 bar has elapsed
+                    if now >= from_dt + timedelta(minutes=15):
+                        from mt5.bar_replay import find_first_exit
+                        exit_result = find_first_exit(
+                            symbol=symbol,
+                            direction=direction,
+                            from_dt=from_dt,
+                            entry=entry,
+                            sl=record.get("sl"),
+                            tp=record.get("tp"),
+                            window_hours=max(_CHECKPOINTS_HOURS),
+                        )
+                        if exit_result is not None:
+                            record["first_exit"]       = exit_result["result"]
+                            record["first_exit_time"]  = exit_result["hit_time"]
+                            record["first_exit_price"] = exit_result["hit_price"]
+                            record["first_exit_pips"]  = exit_result["pnl_pips"]
+                            # Mark as checked only when the result is final:
+                            # sl/tp are definitive immediately; "open" is only
+                            # final once the full 48h window has elapsed.
+                            window_end = from_dt + timedelta(hours=max(_CHECKPOINTS_HOURS))
+                            if exit_result["result"] in ("sl", "tp") or now >= window_end:
+                                record["first_exit_checked"] = True
+                            updated += 1
+                            logger.info(
+                                f"outcome_tracker: {record['signal_id']} [{symbol}] "
+                                f"bar-replay → {exit_result['result']} "
+                                f"pips={exit_result['pnl_pips']} "
+                                f"at {exit_result['hit_time']}"
+                            )
+                except Exception as e:
+                    logger.error(
+                        f"outcome_tracker: bar-replay failed for {record.get('signal_id')}: {e}",
+                        exc_info=True,
+                    )
 
         # Update status
         all_filled   = all(c.get("price") is not None for c in outcomes.values())
@@ -352,6 +390,12 @@ def get_outcome_summary() -> dict[str, Any]:
             if c24.get("direction") == "against" and abs(pip_move) >= 10:
                 false_positives.append({"id": r["signal_id"], "pip_move": pip_move})
 
+    # Bar-replay first-exit breakdown (directional signals only)
+    directional = [r for r in records if r.get("post_debate_signal") in ("Long", "Short")]
+    exit_sl   = [r for r in directional if r.get("first_exit") == "sl"]
+    exit_tp   = [r for r in directional if r.get("first_exit") == "tp"]
+    exit_open = [r for r in directional if r.get("first_exit") == "open"]
+
     return {
         "total":             total,
         "complete":          complete,
@@ -361,4 +405,21 @@ def get_outcome_summary() -> dict[str, Any]:
         "overrides_to_wait": overrides_to_wait,
         "false_negatives_24h": false_negatives,   # debate blocked a good signal
         "false_positives_24h": false_positives,   # debate let through a bad signal
+        # First-exit stats (bar-replay)
+        "directional_signals": len(directional),
+        "first_exit_sl":    len(exit_sl),    # stopped out
+        "first_exit_tp":    len(exit_tp),    # took profit
+        "first_exit_open":  len(exit_open),  # 48h elapsed, neither level reached
+        "first_exit_pending": len(directional) - len(exit_sl) - len(exit_tp) - len(exit_open),
+        "exit_details": [
+            {
+                "id":        r["signal_id"],
+                "symbol":    r["symbol"],
+                "direction": r["post_debate_signal"],
+                "result":    r["first_exit"],
+                "pips":      r["first_exit_pips"],
+                "hit_time":  r["first_exit_time"],
+            }
+            for r in directional if r.get("first_exit") is not None
+        ],
     }

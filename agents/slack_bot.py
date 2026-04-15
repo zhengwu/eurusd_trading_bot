@@ -26,6 +26,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
+import requests
 import anthropic
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -986,6 +987,7 @@ def _get_app() -> App:
             ack()
             signal_id = body["actions"][0]["value"]
             user = body.get("user", {}).get("name", "someone")
+            response_url = body.get("response_url")  # valid 30 min; safer to call directly from thread
 
             # Remove buttons immediately — show processing state
             original_blocks = body.get("message", {}).get("blocks", [])
@@ -999,37 +1001,52 @@ def _get_app() -> App:
             except Exception as e:
                 logger.warning(f"Could not update message during approve: {e}")
 
+            def _post(blocks, text):
+                """Post a replace_original update via response_url (works from any thread)."""
+                if not response_url:
+                    logger.warning("No response_url — cannot update Slack message")
+                    return
+                try:
+                    requests.post(
+                        response_url,
+                        json={"replace_original": True, "blocks": blocks, "text": text},
+                        timeout=10,
+                    )
+                except Exception as e:
+                    logger.error(f"response_url post failed: {e}")
+
             def _run():
-                from agents.job3_executor import approve_and_execute
-                result = approve_and_execute(signal_id)
-                if result.get("ok"):
-                    ticket = result.get("ticket", "?")
-                    price  = result.get("price", "?")
-                    volume = result.get("volume", "?")
-                    if result.get("order_type") == "limit":
-                        status = (
-                            f":white_check_mark: *Limit order placed* by @{user} — "
-                            f"Signal `{signal_id}` | Ticket `{ticket}` | "
-                            f"Limit `{price}` _(pending fill)_ | Volume `{volume}` lots"
-                        )
+                try:
+                    from agents.job3_executor import approve_and_execute
+                    result = approve_and_execute(signal_id)
+                    if result.get("ok"):
+                        ticket = result.get("ticket", "?")
+                        price  = result.get("price", "?")
+                        volume = result.get("volume", "?")
+                        if result.get("order_type") == "limit":
+                            status = (
+                                f":white_check_mark: *Limit order placed* by @{user} — "
+                                f"Signal `{signal_id}` | Ticket `{ticket}` | "
+                                f"Limit `{price}` _(pending fill)_ | Volume `{volume}` lots"
+                            )
+                        else:
+                            status = (
+                                f":white_check_mark: *Executed* by @{user} — "
+                                f"Signal `{signal_id}` | Ticket `{ticket}` | "
+                                f"Fill `{price}` | Volume `{volume}` lots"
+                            )
                     else:
-                        status = (
-                            f":white_check_mark: *Executed* by @{user} — "
-                            f"Signal `{signal_id}` | Ticket `{ticket}` | "
-                            f"Fill `{price}` | Volume `{volume}` lots"
-                        )
-                else:
-                    status = f":x: *Execution failed* — Signal `{signal_id}`: {result.get('error')}"
+                        status = f":x: *Execution failed* — Signal `{signal_id}`: {result.get('error')}"
+                except Exception as e:
+                    logger.error(f"approve_and_execute raised unexpectedly: {e}", exc_info=True)
+                    status = f":x: *Unexpected error* executing `{signal_id}`: {e}"
 
                 result_blocks = [b for b in original_blocks if b.get("type") != "actions"]
                 result_blocks.append({
                     "type": "context",
                     "elements": [{"type": "mrkdwn", "text": status}],
                 })
-                try:
-                    respond(replace_original=True, blocks=result_blocks, text=status)
-                except Exception as e:
-                    logger.error(f"Could not update message after approve: {e}")
+                _post(result_blocks, status)
 
             threading.Thread(target=_run, daemon=True).start()
 

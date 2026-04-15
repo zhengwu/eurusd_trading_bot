@@ -427,68 +427,37 @@ def _hypothetical_outcome(
 ) -> dict | None:
     """
     Replay M15 bars from signal_time to see which was hit first: TP or SL.
-    Uses suggested_entry as the P&L reference price.
+    Delegates to mt5.bar_replay.find_first_exit() and maps back to the
+    trade-journal outcome schema ("hypothetical_sl" / "hypothetical_tp" / "hypothetical_open").
     """
-    import MetaTrader5 as mt5
-    from mt5.connector import get_timeframe
+    from mt5.bar_replay import find_first_exit
 
-    tf  = get_timeframe("M15")
-    now = datetime.now(timezone.utc)
-    to_time = min(signal_time + timedelta(days=window_days), now)
-
-    # MT5 copy_rates_range requires naive UTC datetimes
-    rates = mt5.copy_rates_range(
-        symbol, tf,
-        signal_time.replace(tzinfo=None),
-        to_time.replace(tzinfo=None),
+    result = find_first_exit(
+        symbol=symbol,
+        direction=direction,
+        from_dt=signal_time,
+        entry=suggested_entry,
+        sl=suggested_sl,
+        tp=suggested_tp,
+        window_hours=window_days * 24,
     )
-    if rates is None or len(rates) == 0:
+    if result is None:
         return None
 
-    pip     = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
-    is_long = direction == "Long"
-
-    for bar in rates:
-        h = bar["high"]
-        l = bar["low"]
-
-        if is_long:
-            tp_hit = bool(suggested_tp and h >= suggested_tp)
-            sl_hit = bool(suggested_sl and l <= suggested_sl)
-            # If both breached in the same bar, assume SL hit first (conservative)
-            if sl_hit:
-                pips = round((suggested_sl - suggested_entry) / pip, 1) if suggested_entry else ""
-                return {
-                    "outcome":     "hypothetical_sl",
-                    "pnl_pips":   pips,
-                    "close_price": round(suggested_sl, 5),
-                }
-            if tp_hit:
-                pips = round((suggested_tp - suggested_entry) / pip, 1) if suggested_entry else ""
-                return {
-                    "outcome":     "hypothetical_tp",
-                    "pnl_pips":   pips,
-                    "close_price": round(suggested_tp, 5),
-                }
-        else:  # Short
-            tp_hit = bool(suggested_tp and l <= suggested_tp)
-            sl_hit = bool(suggested_sl and h >= suggested_sl)
-            # If both breached in the same bar, assume SL hit first (conservative)
-            if sl_hit:
-                pips = round((suggested_entry - suggested_sl) / pip, 1) if suggested_entry else ""
-                return {
-                    "outcome":     "hypothetical_sl",
-                    "pnl_pips":   pips,
-                    "close_price": round(suggested_sl, 5),
-                }
-            if tp_hit:
-                pips = round((suggested_entry - suggested_tp) / pip, 1) if suggested_entry else ""
-                return {
-                    "outcome":     "hypothetical_tp",
-                    "pnl_pips":   pips,
-                    "close_price": round(suggested_tp, 5),
-                }
-
+    r = result["result"]
+    pips = result["pnl_pips"] if result["pnl_pips"] is not None else ""
+    if r == "sl":
+        return {
+            "outcome":     "hypothetical_sl",
+            "pnl_pips":    pips,
+            "close_price": round(result["hit_price"], 5),
+        }
+    if r == "tp":
+        return {
+            "outcome":     "hypothetical_tp",
+            "pnl_pips":    pips,
+            "close_price": round(result["hit_price"], 5),
+        }
     return {"outcome": "hypothetical_open", "pnl_pips": ""}
 
 

@@ -20,8 +20,11 @@ Typically called directly from the Slack bot after user approval.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -31,7 +34,7 @@ load_dotenv()
 import config
 from mt5.connector import connect, disconnect, is_connected
 from mt5.position_reader import get_current_tick, get_open_positions
-from mt5.risk_manager import calculate_lot_size, calculate_sl_tp, sl_pips_from_price
+from mt5.risk_manager import calculate_lot_size, calculate_sl_tp, sl_pips_from_price, uncertainty_risk_pct
 from mt5.order_manager import open_position, close_position, place_limit_order
 from pipeline.signal_store import (
     approve_signal,
@@ -43,6 +46,38 @@ from pipeline.signal_store import (
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# ── ticket map ────────────────────────────────────────────────────────────────
+# Maps MT5 ticket (str) → signal_id so Job 2 can look up the original signal.
+_TICKET_MAP_PATH = config.DATA_DIR / "ticket_map.json"
+_ticket_map_lock = threading.Lock()
+
+
+def _write_ticket_map(ticket: int, signal_id: str) -> None:
+    """Persist ticket → signal_id mapping for Job 2 reverse lookup."""
+    with _ticket_map_lock:
+        try:
+            config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+            data: dict = {}
+            if _TICKET_MAP_PATH.exists():
+                data = json.loads(_TICKET_MAP_PATH.read_text(encoding="utf-8"))
+            data[str(ticket)] = signal_id
+            _TICKET_MAP_PATH.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.warning(f"ticket_map write failed: {e}")
+
+
+def get_signal_id_for_ticket(ticket: int) -> str | None:
+    """Return the signal_id for an MT5 ticket, or None if not found."""
+    try:
+        if not _TICKET_MAP_PATH.exists():
+            return None
+        data = json.loads(_TICKET_MAP_PATH.read_text(encoding="utf-8"))
+        return data.get(str(ticket))
+    except Exception:
+        return None
 
 
 # ── execution logic ───────────────────────────────────────────────────────────
@@ -64,6 +99,19 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
         direction = "buy" if action == "Long" else "sell"
 
         symbol = signal.get("_symbol", config.MT5_SYMBOL)
+
+        # ── Portfolio risk gate ────────────────────────────────────────────
+        equity_pre = _get_equity()
+        if equity_pre is not None:
+            from mt5.portfolio_risk import check_portfolio_risk
+            risk_check = check_portfolio_risk(direction, symbol, equity_pre)
+            if not risk_check["ok"]:
+                logger.warning(
+                    f"Portfolio risk blocked signal {signal.get('id', '?')}: "
+                    f"{risk_check['reason']}"
+                )
+                return {"ok": False, "error": f"Portfolio risk guard: {risk_check['reason']}"}
+
         limit_price = signal.get("_limit_price")
 
         # For SL/TP and lot calculation, use limit price as reference if set,
@@ -86,8 +134,14 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
         if account_info is None:
             return {"ok": False, "error": "Cannot read account equity"}
 
+        unc = signal.get("uncertainty_score")
+        risk_pct = uncertainty_risk_pct(config.JOB3_RISK_PCT, unc)
+        logger.info(
+            f"Lot sizing: uncertainty={unc} → risk_pct={risk_pct}% "
+            f"(base={config.JOB3_RISK_PCT}%)"
+        )
         lot = signal.get("_lot_override") or calculate_lot_size(
-            account_info, config.JOB3_RISK_PCT, sl_pips, symbol=symbol
+            account_info, risk_pct, sl_pips, symbol=symbol
         )
 
         if limit_price:
@@ -297,13 +351,15 @@ def approve_and_execute(
     result = execute_signal(signal, trim_pct=trim_pct)
     mark_executed(signal_id, result)
 
-    # Link MT5 ticket to trade journal on success
+    # Link MT5 ticket to trade journal and ticket map on success
     if result.get("ok") and result.get("ticket"):
+        ticket = result["ticket"]
         try:
             from analysis.trade_journal import link_ticket
-            link_ticket(signal_id, result["ticket"])
+            link_ticket(signal_id, ticket)
         except Exception as e:
             logger.error(f"Journal link_ticket failed: {e}")
+        _write_ticket_map(ticket, signal_id)
 
     return result
 

@@ -21,6 +21,34 @@ def _pip_value(symbol: str) -> float:
     return config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip_value_per_lot"]
 
 
+def uncertainty_risk_pct(base_pct: float, uncertainty: int | float | None) -> float:
+    """
+    Scale the base risk % down based on the ensemble debate uncertainty score.
+
+    Uses the tier table in config.JOB3_UNCERTAINTY_TIERS (list of (threshold, multiplier)
+    sorted ascending by threshold). The first tier whose threshold >= uncertainty wins.
+    Falls back to base_pct when uncertainty is None (no debate ran).
+
+    Example with base_pct=2.0:
+      uncertainty=20  → 2.0 × 1.00 = 2.0%  (high conviction)
+      uncertainty=45  → 2.0 × 0.75 = 1.5%  (medium conviction)
+      uncertainty=65  → 2.0 × 0.50 = 1.0%  (low conviction, passed veto)
+      uncertainty=None→ 2.0%               (no debate data)
+    """
+    if uncertainty is None:
+        return base_pct
+    for threshold, multiplier in sorted(config.JOB3_UNCERTAINTY_TIERS, key=lambda t: t[0]):
+        if uncertainty <= threshold:
+            scaled = round(base_pct * multiplier, 4)
+            logger.debug(
+                f"uncertainty_risk_pct: uncertainty={uncertainty} → tier <={threshold} "
+                f"({multiplier:.0%}) → {scaled}% (base={base_pct}%)"
+            )
+            return scaled
+    # uncertainty exceeds all tiers — should be vetoed before reaching here
+    return round(base_pct * 0.50, 4)
+
+
 def calculate_lot_size(equity: float, risk_pct: float, sl_pips: float, symbol: str | None = None) -> float:
     """
     Calculate position size based on account equity and SL distance.

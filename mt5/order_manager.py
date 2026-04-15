@@ -60,7 +60,8 @@ def _clamp_stops(
         return sl, tp
 
     # stops_level is in points; point is the smallest price increment (0.00001 for 5-decimal pairs)
-    stops_level = info.stops_level or 0
+    # Some brokers/MT5 builds don't expose stops_level on SymbolInfo — fall back to 0 safely.
+    stops_level = getattr(info, "stops_level", None) or 0
     min_dist = (stops_level + _MIN_STOP_BUFFER_PIPS * 10) * info.point  # 1 pip = 10 points for 5-decimal
 
     if min_dist <= 0:

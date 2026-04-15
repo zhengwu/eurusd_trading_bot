@@ -1,10 +1,33 @@
-"""Job 2 — Position Monitor.
+"""Job 2 — Dynamic Position Manager.
 
-Monitors open EUR/USD positions via MT5 and uses Claude Sonnet to generate
-risk management recommendations: Hold / Trim / Exit.
+Monitors open positions via MT5 and applies a two-layer decision process:
 
-Runs every JOB2_CHECK_INTERVAL_MINUTES during forex market hours.
-Recommendations are sent to Slack and saved as pending signals for Job 3.
+  Layer 1 — Phase Engine (hard rules, no LLM):
+    Determines the current phase of each trade from objective data:
+      Phase 0 EARLY     — trade not yet at breakeven threshold, just monitor
+      Phase 1 BREAKEVEN — trade reached JOB2_BREAKEVEN_R; move SL to entry + buffer
+      Phase 2 PROFIT    — trade reached JOB2_PARTIAL_TP_R; suggest trim
+      Phase 3 TRAIL     — trade reached JOB2_TRAIL_R; trail SL at ATR distance
+      Phase 4 OVERDUE   — trade open longer than expected horizon; tighten/exit
+    Auto-executes protective actions (breakeven SL, trail update) without approval.
+
+  Layer 2 — LLM Judgment (Claude Sonnet):
+    Given the phase context, enriched position data, and market indicators,
+    the LLM answers phase-specific questions:
+      Phase 0/1 — Is the thesis still valid? Any early exit signals?
+      Phase 2   — Should we trim 33%, 50%, or hold for a bigger move?
+      Phase 3   — Is momentum still supporting the trend, or should we tighten faster?
+      Phase 4   — Is there any reason to hold past the expected horizon, or exit now?
+
+Operational safeguards (checked before any SL/TP modification):
+  - Spread must be within JOB2_MAX_SPREAD_MULT × normal_spread_pips
+  - No high-impact news event within JOB2_NEWS_BLACKOUT_MIN minutes
+  - Minimum lot check before Trim: position volume must be > 2 × JOB3_MIN_LOT
+
+Signal routing:
+  Auto-execute (no approval):  breakeven SL move, trail SL update
+  Approval required:           Trim, Exit, suggested new TP
+  Notify only:                 Hold recommendations
 
 Usage (standalone):
     conda activate mt5_env
@@ -19,7 +42,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import anthropic
@@ -30,6 +53,8 @@ load_dotenv()
 import config
 from mt5.connector import connect, disconnect, is_connected
 from mt5.position_reader import get_open_positions, get_account_summary, get_current_tick
+from mt5.order_manager import modify_sl_tp
+from mt5.portfolio_risk import get_portfolio_summary
 from analysis.context_builder import build_context
 from notifications.notifier import notify
 from utils.logger import get_logger
@@ -39,6 +64,40 @@ logger = get_logger(__name__)
 
 _client: anthropic.Anthropic | None = None
 
+# ── phase watcher shared state ────────────────────────────────────────────────
+# Keyed by MT5 ticket (int). Written only by the watcher loop.
+# _sl_cache stores original_sl_pips at first sight — never updated after that,
+# so R-multiples are always relative to the original entry risk even after SL moves.
+
+_phase_state: dict[int, str]   = {}   # ticket → last known phase
+_sl_cache: dict[int, float]    = {}   # ticket → original_sl_pips (set once, then frozen)
+_last_watcher_trigger: dict[int, float] = {}  # ticket → timestamp of last watcher analysis
+
+# Expected horizon in hours — maps time_horizon strings from signals
+_HORIZON_HOURS: dict[str, float] = {
+    "scalp":    2.0,
+    "intraday": 8.0,
+    "today":    8.0,
+    "1-day":    24.0,
+    "1 day":    24.0,
+    "2-day":    48.0,
+    "2 day":    48.0,
+    "swing":    96.0,
+    "week":     168.0,
+    "medium":   336.0,
+}
+_DEFAULT_HORIZON_HOURS = 24.0
+
+# Phase labels
+PHASE_LOSS_DEEP = "loss_deep"   # R < JOB2_LOSS_DEEP_R  — approaching SL, urgent review
+PHASE_LOSS_MILD = "loss_mild"   # JOB2_LOSS_DEEP_R ≤ R < 0 — in loss but within noise range
+PHASE_EARLY     = "early"       # 0 ≤ R < JOB2_BREAKEVEN_R — in profit but not yet breakeven
+PHASE_BREAKEVEN = "breakeven"   # JOB2_BREAKEVEN_R ≤ R < JOB2_PARTIAL_TP_R
+PHASE_PROFIT    = "profit"      # JOB2_PARTIAL_TP_R ≤ R < JOB2_TRAIL_R
+PHASE_TRAIL     = "trail"       # R ≥ JOB2_TRAIL_R
+PHASE_OVERDUE   = "overdue"     # hours_open > JOB2_OVERDUE_MULT × expected_horizon
+PHASE_UNKNOWN   = "unknown"     # no original SL data — can't compute R
+
 
 def _get_client() -> anthropic.Anthropic:
     global _client
@@ -47,100 +106,339 @@ def _get_client() -> anthropic.Anthropic:
     return _client
 
 
-# ── prompts ───────────────────────────────────────────────────────────────────
+# ── ticket → original signal lookup ──────────────────────────────────────────
 
-def _get_system(symbol: str) -> str:
-    display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
-    return (
-        f"You are a professional {display} forex risk manager. "
-        "Your job is to protect open positions, not to predict new trades."
+def _get_original_signal(ticket: int | None) -> dict | None:
+    """
+    Look up the original signal that opened a position via ticket_map.json
+    then the trade journal.  Returns the journal record, or None.
+    """
+    if ticket is None:
+        return None
+    try:
+        from agents.job3_executor import get_signal_id_for_ticket
+        signal_id = get_signal_id_for_ticket(ticket)
+        if not signal_id:
+            return None
+        from analysis.trade_journal import _load as _journal_load
+        for rec in _journal_load():
+            if rec.get("signal_id") == signal_id:
+                return rec
+    except Exception as e:
+        logger.debug(f"Original signal lookup failed for #{ticket}: {e}")
+    return None
+
+
+# ── phase engine ──────────────────────────────────────────────────────────────
+
+def _expected_horizon_hours(original: dict | None) -> float:
+    """Map time_horizon string from original signal to expected hours."""
+    if not original:
+        return _DEFAULT_HORIZON_HOURS
+    horizon_str = (original.get("time_horizon") or "").lower()
+    for key, hours in _HORIZON_HOURS.items():
+        if key in horizon_str:
+            return hours
+    return _DEFAULT_HORIZON_HOURS
+
+
+def _compute_phase(pos: dict, original: dict | None) -> dict:
+    """
+    Compute the current trade phase and supporting metrics from hard rules.
+
+    Returns a dict with:
+      phase           — one of the PHASE_* constants
+      current_r       — pips-in-profit / original_sl_pips (None if unknown)
+      pips_profit     — raw pip move in trade direction
+      original_sl_pips — SL distance at time of entry (from journal)
+      sl_at_breakeven — True if SL is already at or beyond entry
+      hours_in_trade  — time since position opened
+      expected_hours  — expected trade horizon in hours
+      is_overdue      — True if hours_in_trade > OVERDUE_MULT * expected_hours
+      net_pnl         — profit + swap (actual net P&L including carry cost)
+    """
+    symbol    = pos.get("symbol", config.MT5_SYMBOL)
+    pip       = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
+    direction = pos.get("type", "buy")
+
+    open_price    = pos.get("open_price", 0.0)
+    current_price = pos.get("current_price", 0.0)
+    sl            = pos.get("sl") or 0.0
+    profit        = pos.get("profit", 0.0)
+    swap          = pos.get("swap", 0.0)
+    net_pnl       = round(profit + swap, 2)
+
+    # Pip move in trade direction
+    if direction == "buy":
+        pips_profit = (current_price - open_price) / pip
+    else:
+        pips_profit = (open_price - current_price) / pip
+    pips_profit = round(pips_profit, 1)
+
+    # Time in trade
+    hours_in_trade = 0.0
+    if pos.get("open_time"):
+        try:
+            opened = datetime.fromisoformat(pos["open_time"])
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            hours_in_trade = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
+        except Exception:
+            pass
+
+    expected_hours = _expected_horizon_hours(original)
+    is_overdue     = hours_in_trade > config.JOB2_OVERDUE_MULT * expected_hours
+
+    # Original SL distance — needed to compute R-multiple
+    original_sl_pips: float | None = None
+    if original:
+        try:
+            actual_sl    = float(original.get("actual_sl") or 0)
+            actual_entry = float(original.get("actual_entry") or 0)
+            if actual_sl and actual_entry:
+                if direction == "buy":
+                    original_sl_pips = max(0.0, (actual_entry - actual_sl) / pip)
+                else:
+                    original_sl_pips = max(0.0, (actual_sl - actual_entry) / pip)
+        except Exception:
+            pass
+
+    # Fall back: infer from current SL if available and trade is early
+    if not original_sl_pips and sl:
+        if direction == "buy":
+            original_sl_pips = max(0.0, (open_price - sl) / pip)
+        else:
+            original_sl_pips = max(0.0, (sl - open_price) / pip)
+
+    # Compute R-multiple
+    current_r: float | None = None
+    if original_sl_pips and original_sl_pips > 0:
+        current_r = round(pips_profit / original_sl_pips, 2)
+
+    # SL at or beyond breakeven?
+    if direction == "buy":
+        sl_at_breakeven = bool(sl and sl >= open_price)
+    else:
+        sl_at_breakeven = bool(sl and sl <= open_price)
+
+    # Determine phase
+    if is_overdue:
+        phase = PHASE_OVERDUE
+    elif current_r is None:
+        phase = PHASE_UNKNOWN
+    elif current_r >= config.JOB2_TRAIL_R:
+        phase = PHASE_TRAIL
+    elif current_r >= config.JOB2_PARTIAL_TP_R:
+        phase = PHASE_PROFIT
+    elif current_r >= config.JOB2_BREAKEVEN_R:
+        phase = PHASE_BREAKEVEN
+    elif current_r >= 0:
+        phase = PHASE_EARLY
+    elif current_r >= config.JOB2_LOSS_DEEP_R:
+        phase = PHASE_LOSS_MILD
+    else:
+        phase = PHASE_LOSS_DEEP
+
+    return {
+        "phase":             phase,
+        "current_r":         current_r,
+        "pips_profit":       pips_profit,
+        "original_sl_pips":  original_sl_pips,
+        "sl_at_breakeven":   sl_at_breakeven,
+        "hours_in_trade":    round(hours_in_trade, 1),
+        "expected_hours":    expected_hours,
+        "is_overdue":        is_overdue,
+        "net_pnl":           net_pnl,
+    }
+
+
+# ── operational safeguards ────────────────────────────────────────────────────
+
+def _spread_ok(symbol: str) -> tuple[bool, float, float]:
+    """
+    Return (ok, current_spread_pips, normal_spread_pips).
+    ok=False means spread is too wide for safe SL/TP modification.
+    """
+    normal = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL]).get(
+        "normal_spread_pips", 1.5
+    )
+    pip    = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
+    tick   = get_current_tick(symbol=symbol)
+    if tick is None:
+        return True, 0.0, normal   # can't check — allow through
+    current_spread_pips = round(tick.get("spread", 0.0) / pip, 1)
+    ok = current_spread_pips <= normal * config.JOB2_MAX_SPREAD_MULT
+    return ok, current_spread_pips, normal
+
+
+def _in_news_blackout(symbol: str) -> tuple[bool, str]:
+    """
+    Return (in_blackout, event_name).
+    in_blackout=True means a high-impact event is imminent — skip modifications.
+    """
+    try:
+        from pipeline.pre_event_agent import get_upcoming_high_impact
+        events = get_upcoming_high_impact(
+            symbol,
+            lookahead_min_low=0,
+            lookahead_min_high=config.JOB2_NEWS_BLACKOUT_MIN,
+        )
+        if events:
+            return True, events[0].get("event", "upcoming event")
+    except Exception as e:
+        logger.debug(f"News blackout check failed: {e}")
+    return False, ""
+
+
+def _can_trim(pos: dict) -> bool:
+    """Return True if the position volume allows a partial close."""
+    return pos.get("volume", 0.0) > config.JOB3_MIN_LOT * 2
+
+
+# ── auto-execute protective actions ──────────────────────────────────────────
+
+def _auto_breakeven(pos: dict, phase_info: dict) -> dict | None:
+    """
+    Move SL to entry + buffer if config.JOB2_AUTO_BREAKEVEN is enabled and
+    the SL is not already at/above breakeven.
+
+    Returns the modify_sl_tp result dict, or None if skipped.
+    """
+    if not config.JOB2_AUTO_BREAKEVEN:
+        return None
+    if phase_info["sl_at_breakeven"]:
+        logger.debug(f"#{pos.get('ticket')} SL already at breakeven — skipping")
+        return None
+
+    symbol    = pos.get("symbol", config.MT5_SYMBOL)
+    pip       = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
+    direction = pos.get("type", "buy")
+    entry     = pos.get("open_price", 0.0)
+    current_tp = pos.get("tp") or None
+    buffer    = config.JOB2_BREAKEVEN_BUFFER_PIPS * pip
+
+    new_sl = round(
+        entry + buffer if direction == "buy" else entry - buffer,
+        config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["price_decimals"],
     )
 
+    logger.info(
+        f"Auto-breakeven #{pos.get('ticket')}: SL → {new_sl} "
+        f"(entry {entry} + {config.JOB2_BREAKEVEN_BUFFER_PIPS}p buffer)"
+    )
+    return modify_sl_tp(pos["ticket"], sl=new_sl, tp=current_tp)
 
-_PROMPT_TEMPLATE = """\
-You are monitoring an open {display} position. Review the position details,
-account health, and current market context. Recommend whether to hold, trim,
-or exit the position to protect capital.
 
-=== OPEN POSITION ===
-{position_details}
+def _auto_trail(pos: dict, indicators: dict) -> dict | None:
+    """
+    Trail SL at JOB2_TRAIL_ATR_MULT × ATR-M15 behind current price.
+    Only advances the SL — never moves it backwards.
 
-=== ACCOUNT STATUS ===
-{account_details}
+    Returns the modify_sl_tp result dict, or None if skipped.
+    """
+    if not config.JOB2_AUTO_TRAIL:
+        return None
 
-=== CURRENT MARKET SNAPSHOT ===
-{market_snapshot}
+    atr_m15 = indicators.get("atr_m15")
+    if not atr_m15:
+        logger.debug("No M15 ATR available — skipping trail")
+        return None
 
-=== RECENT MARKET CONTEXT ===
-{market_context}
+    symbol        = pos.get("symbol", config.MT5_SYMBOL)
+    decimals      = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["price_decimals"]
+    direction     = pos.get("type", "buy")
+    current_price = pos.get("current_price", 0.0)
+    current_sl    = pos.get("sl") or 0.0
+    current_tp    = pos.get("tp") or None
+    trail_dist    = atr_m15 * config.JOB2_TRAIL_ATR_MULT
 
-Provide your recommendation in the following JSON format:
-{{
-  "action": "Hold | Trim | Exit",
-  "confidence": "High | Medium | Low",
-  "rationale": "2-3 sentence explanation referencing specific position and market data",
-  "risk_note": "Any immediate risks to the position",
-  "suggested_sl": null,
-  "suggested_tp": null
-}}
+    if direction == "buy":
+        new_sl = round(current_price - trail_dist, decimals)
+        if current_sl and new_sl <= current_sl:
+            logger.debug(f"#{pos.get('ticket')} trail would move SL backwards — skipping")
+            return None
+    else:
+        new_sl = round(current_price + trail_dist, decimals)
+        if current_sl and new_sl >= current_sl:
+            logger.debug(f"#{pos.get('ticket')} trail would move SL backwards — skipping")
+            return None
 
-Rules:
-- Recommend "Exit" only if there is clear evidence the original thesis is broken
-- Recommend "Trim" if risk/reward has deteriorated but direction is still valid
-- Recommend "Hold" if the position is on track
-- suggested_sl / suggested_tp should be float prices or null
-
-Return ONLY valid JSON, no other text."""
+    logger.info(
+        f"Auto-trail #{pos.get('ticket')}: SL {current_sl} → {new_sl} "
+        f"(price {current_price}, ATR×{config.JOB2_TRAIL_ATR_MULT}={trail_dist:.5f})"
+    )
+    return modify_sl_tp(pos["ticket"], sl=new_sl, tp=current_tp)
 
 
 # ── formatters ────────────────────────────────────────────────────────────────
 
-def _fmt_position(pos: dict) -> str:
-    direction = pos.get("type", "").upper()
-    open_price = pos.get("open_price", 0)
+def _fmt_position(pos: dict, phase_info: dict) -> str:
+    symbol        = pos.get("symbol", config.MT5_SYMBOL)
+    pip           = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
+    direction     = pos.get("type", "").upper()
+    open_price    = pos.get("open_price", 0)
     current_price = pos.get("current_price", 0)
-    symbol = pos.get("symbol", config.MT5_SYMBOL)
-    pip = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
-    pips_move = (current_price - open_price) / pip if direction == "BUY" else (open_price - current_price) / pip
-    profit_str = f"${pos.get('profit', 0):.2f} ({pips_move:+.1f} pips)"
-    open_est = to_est(datetime.fromisoformat(pos["open_time"])).strftime("%Y-%m-%d %H:%M EST") if pos.get("open_time") else "N/A"
+    sl            = pos.get("sl") or "None"
+    tp            = pos.get("tp") or "None"
+    open_est      = ""
+    if pos.get("open_time"):
+        try:
+            open_est = to_est(
+                datetime.fromisoformat(pos["open_time"])
+            ).strftime("%Y-%m-%d %H:%M EST")
+        except Exception:
+            pass
+
+    cr = phase_info["current_r"]
+    if cr is None:
+        r_str = "unknown"
+    elif cr < 0:
+        pct_to_sl = round(abs(cr) * 100)
+        r_str = f"{cr:.2f}R  [{pct_to_sl}% of the way to SL]"
+    else:
+        r_str = f"{cr:.2f}R"
+    be_str = " [SL at breakeven]" if phase_info["sl_at_breakeven"] else ""
 
     return (
-        f"  Ticket       : {pos.get('ticket')}\n"
-        f"  Direction    : {direction}\n"
-        f"  Volume       : {pos.get('volume')} lots\n"
-        f"  Open Price   : {open_price}\n"
-        f"  Current Price: {current_price}\n"
-        f"  P&L          : {profit_str}\n"
-        f"  Stop Loss    : {pos.get('sl') or 'None'}\n"
-        f"  Take Profit  : {pos.get('tp') or 'None'}\n"
-        f"  Opened       : {open_est}"
+        f"  Ticket         : {pos.get('ticket')}\n"
+        f"  Symbol         : {symbol}\n"
+        f"  Direction      : {direction}\n"
+        f"  Volume         : {pos.get('volume')} lots\n"
+        f"  Open Price     : {open_price}\n"
+        f"  Current Price  : {current_price}\n"
+        f"  Pips in trade  : {phase_info['pips_profit']:+.1f}p\n"
+        f"  R-multiple     : {r_str}{be_str}\n"
+        f"  Net P&L        : ${phase_info['net_pnl']:.2f} (incl. swap ${pos.get('swap', 0):.2f})\n"
+        f"  Stop Loss      : {sl}\n"
+        f"  Take Profit    : {tp}\n"
+        f"  Opened         : {open_est}\n"
+        f"  Time in trade  : {phase_info['hours_in_trade']:.1f}h "
+        f"(expected horizon: {phase_info['expected_hours']:.0f}h)"
+        + (f"  *** OVERDUE ***" if phase_info["is_overdue"] else "")
     )
 
 
 def _fmt_account(acct: dict) -> str:
-    equity = acct.get("equity")
-    balance = acct.get("balance")
-    drawdown_pct = None
+    equity   = acct.get("equity")
+    balance  = acct.get("balance")
+    drawdown = None
     if equity is not None and balance and balance > 0:
-        drawdown_pct = round((balance - equity) / balance * 100, 2)
-
+        drawdown = round((balance - equity) / balance * 100, 2)
     lines = (
         f"  Equity       : ${equity}\n"
         f"  Balance      : ${balance}\n"
         f"  Free Margin  : ${acct.get('free_margin')}\n"
         f"  Margin Level : {acct.get('margin_level')}%"
     )
-    if drawdown_pct is not None:
-        lines += f"\n  Drawdown     : {drawdown_pct}%"
+    if drawdown is not None:
+        lines += f"\n  Drawdown     : {drawdown}%"
     return lines
 
 
-def _fmt_market_snapshot(tick: dict | None, symbol: str | None = None) -> str:
+def _fmt_market_snapshot(tick: dict | None, symbol: str) -> str:
     if tick is None:
         return "  (tick unavailable)"
-    sym = symbol or config.MT5_SYMBOL
-    pip = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["pip"]
+    pip     = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
     now_est = to_est(datetime.now(timezone.utc)).strftime("%H:%M EST")
     return (
         f"  Time  : {now_est}\n"
@@ -150,37 +448,241 @@ def _fmt_market_snapshot(tick: dict | None, symbol: str | None = None) -> str:
     )
 
 
-# ── analysis ──────────────────────────────────────────────────────────────────
+def _fmt_indicators(indicators: dict) -> str:
+    if not indicators:
+        return "  (indicators unavailable)"
+    lines = []
+    if indicators.get("atr_m15") is not None:
+        pair_cfg = {}  # generic
+        lines.append(f"  ATR-M15 : {indicators['atr_m15']:.5f}  (intraday noise / trail distance)")
+    if indicators.get("rsi_m15") is not None:
+        rsi = indicators["rsi_m15"]
+        lbl = "Overbought ⚠" if rsi >= 70 else "Oversold ⚠" if rsi <= 30 else "Neutral"
+        lines.append(f"  RSI-M15 : {rsi}  — {lbl}")
+    if indicators.get("m15_momentum"):
+        lines.append(f"  M15 bias: {indicators['m15_momentum']}")
+    if indicators.get("rsi_d1") is not None:
+        rsi = indicators["rsi_d1"]
+        lbl = "Overbought ⚠" if rsi >= 70 else "Oversold ⚠" if rsi <= 30 else "Neutral"
+        lines.append(f"  RSI-D1  : {rsi}  — {lbl}")
+    if indicators.get("macd_hist") is not None:
+        hist = indicators["macd_hist"]
+        lbl  = "bullish momentum" if hist > 0 else "bearish momentum"
+        lines.append(f"  MACD    : hist={hist:+.6f}  ({lbl})")
+    return "\n".join(lines) if lines else "  (no indicator data)"
 
-def analyze_position(pos: dict) -> dict[str, Any] | None:
-    """Run Claude Sonnet analysis on a single open position."""
-    symbol = pos.get("symbol", config.MT5_SYMBOL)
-    display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
-    account = get_account_summary()
-    tick = get_current_tick(symbol=symbol)
 
-    # Build a lightweight market context (today's intraday + recent prices only)
-    try:
-        market_context = build_context(trigger_item=None, symbol=symbol)
-        # Keep context short for position monitor — first 2000 chars is enough
-        market_context = market_context[:2000]
-    except Exception as e:
-        logger.warning(f"Context build failed: {e}")
-        market_context = "(market context unavailable)"
+def _fmt_portfolio(portfolio: dict, pos_ticket: int) -> str:
+    """Format portfolio exposure context, excluding the current position."""
+    others = [p for p in portfolio.get("positions", []) if p.get("ticket") != pos_ticket]
+    if not others:
+        return "  No other open positions."
+    lines = []
+    for p in others:
+        lines.append(
+            f"  {p['symbol']} {p['direction'].upper()} "
+            f"{p['lot']}L  risk={p['risk_pct']:.1f}%  bucket={p['bucket']}"
+        )
+    lines.append(
+        f"  Total open risk (excl. this position): "
+        f"{portfolio.get('total_risk_pct', 0):.1f}%"
+    )
+    return "\n".join(lines)
 
-    prompt = _PROMPT_TEMPLATE.format(
-        display=display,
-        position_details=_fmt_position(pos),
-        account_details=_fmt_account(account),
-        market_snapshot=_fmt_market_snapshot(tick, symbol=symbol),
-        market_context=market_context,
+
+def _fmt_original_signal(original: dict | None) -> str:
+    if not original:
+        return "  (original signal not found — position may have been opened manually)"
+    return (
+        f"  Signal      : {original.get('signal')} [{original.get('confidence')}]\n"
+        f"  Time horizon: {original.get('time_horizon')}\n"
+        f"  Rationale   : {original.get('rationale', '')[:300]}\n"
+        f"  Invalidation: {original.get('invalidation', '')}\n"
+        f"  Risk note   : {original.get('risk_note', '')}"
     )
 
+
+# ── phase-specific prompts ────────────────────────────────────────────────────
+
+def _build_prompt(
+    pos: dict,
+    phase_info: dict,
+    account: dict,
+    tick: dict | None,
+    indicators: dict,
+    original: dict | None,
+    portfolio: dict,
+    spread_ok: bool,
+    in_blackout: bool,
+    blackout_event: str,
+    market_context: str,
+) -> str:
+    symbol  = pos.get("symbol", config.MT5_SYMBOL)
+    display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
+    phase   = phase_info["phase"]
+
+    safeguard_note = ""
+    if not spread_ok:
+        safeguard_note += "\n⚠ SPREAD WARNING: Spread is elevated — do NOT recommend SL/TP modifications."
+    if in_blackout:
+        safeguard_note += f"\n⚠ NEWS BLACKOUT: {blackout_event} is imminent — do NOT recommend SL/TP modifications."
+
+    # Phase-specific question block
+    if phase == PHASE_LOSS_DEEP:
+        pct_to_sl = round(abs(phase_info["current_r"]) * 100)
+        phase_block = (
+            f"The trade is at {phase_info['current_r']:.2f}R — {pct_to_sl}% of the way to the stop loss.\n"
+            "This is an URGENT review. Focus on:\n"
+            "1. Has the original thesis been invalidated by current market conditions or news?\n"
+            "2. Is this drawdown a directional move against you, or temporary noise within ATR range?\n"
+            "   (Check ATR-M15 vs the current pip loss — is the move > 1.5× ATR?)\n"
+            "3. Is momentum (RSI, MACD, M15 bias) confirming continuation against you?\n"
+            "If the thesis is broken OR the move is clearly directional: recommend Exit to preserve capital.\n"
+            "If this is noise within ATR range AND the thesis is intact: Hold may be justified, but explain specifically."
+        )
+        allowed_actions = '"Exit" (strongly preferred if thesis broken) or "Hold" (must cite specific thesis evidence and ATR context). No Trim or SL moves — position needs a binary decision.'
+
+    elif phase == PHASE_LOSS_MILD:
+        pct_to_sl = round(abs(phase_info["current_r"]) * 100)
+        phase_block = (
+            f"The trade is at {phase_info['current_r']:.2f}R — {pct_to_sl}% of the way to the stop loss.\n"
+            "This is within the normal noise range. Focus on:\n"
+            "1. Is the original thesis still intact? Has any news or price action undermined it?\n"
+            "2. Is the current pullback normal retracement, or is momentum turning against the trade?\n"
+            "   (Use RSI-M15, MACD histogram direction, and M15 momentum bias as evidence.)\n"
+            "3. Is there a reason to exit early, or is the original SL placement still valid?"
+        )
+        allowed_actions = '"Hold" (thesis intact, noise within ATR) or "Exit" (thesis weakening). Do NOT suggest Trim or SL/TP changes for a losing position.'
+
+    elif phase == PHASE_EARLY:
+        phase_block = (
+            "The trade has not yet reached the breakeven threshold.\n"
+            "Focus on: Is the original thesis still intact given current market conditions? "
+            "Are there early warning signs that would justify an early exit before SL is hit?"
+        )
+        allowed_actions = '"Hold" or "Exit" only. Do NOT suggest Trim or SL/TP changes unless spread is OK and no blackout.'
+    elif phase == PHASE_BREAKEVEN:
+        be_note = (
+            "NOTE: Breakeven SL move will be auto-executed by the system if safeguards pass."
+            if config.JOB2_AUTO_BREAKEVEN else
+            "Breakeven SL move requires your recommendation."
+        )
+        phase_block = (
+            f"The trade has reached {phase_info['current_r']:.2f}R — breakeven zone.\n"
+            f"{be_note}\n"
+            "Focus on: Is the original thesis still valid and worth holding through? "
+            "Or has the move stalled and should we exit while in profit?"
+        )
+        allowed_actions = '"Hold", "Exit", or "SetSL" (new breakeven SL price).'
+    elif phase == PHASE_PROFIT:
+        trim_note = (
+            "NOTE: Position can be trimmed (volume allows partial close)."
+            if _can_trim(pos) else
+            "NOTE: Position volume is too small to trim — only Hold or Exit available."
+        )
+        phase_block = (
+            f"The trade has reached {phase_info['current_r']:.2f}R — partial profit zone.\n"
+            f"{trim_note}\n"
+            "Focus on: Should we take partial profit now (and what %)? "
+            "Is momentum continuing or showing exhaustion signals? "
+            "Should we move TP to capture the current move?"
+        )
+        allowed_actions = (
+            '"Hold", "Exit", or "Trim" (with suggested_trim_pct 25-75).'
+            + (' "SetTP" also allowed if you see a better target.' if not in_blackout and spread_ok else "")
+        )
+    elif phase == PHASE_TRAIL:
+        trail_note = (
+            f"NOTE: ATR-based trailing SL will be auto-executed by the system (ATR-M15 × {config.JOB2_TRAIL_ATR_MULT})."
+            if config.JOB2_AUTO_TRAIL else
+            "ATR-based trailing requires your SetSL recommendation."
+        )
+        phase_block = (
+            f"The trade has reached {phase_info['current_r']:.2f}R — trailing zone.\n"
+            f"{trail_note}\n"
+            "Focus on: Is momentum still strong enough to trail, or is the move exhausting? "
+            "Should we tighten the trail multiplier or take full profit now?"
+        )
+        allowed_actions = '"Hold" (trail continues), "Exit" (take all profit now), or "Trim" (take some profit, trail remainder).'
+    elif phase == PHASE_OVERDUE:
+        phase_block = (
+            f"The trade has been open {phase_info['hours_in_trade']:.0f}h against "
+            f"an expected horizon of {phase_info['expected_hours']:.0f}h — "
+            f"it is overdue by {phase_info['hours_in_trade'] - phase_info['expected_hours']:.0f}h.\n"
+            "Focus on: Is there a compelling reason to hold beyond the expected horizon? "
+            "If not, recommend Exit or at minimum SetSL to protect remaining profit."
+        )
+        allowed_actions = '"Hold" (must justify), "Exit", "Trim", or "SetSL" to tighten stop.'
+    else:  # PHASE_UNKNOWN
+        phase_block = (
+            "Could not compute R-multiple (no original SL data). "
+            "Assess the position on its current P&L and market conditions alone."
+        )
+        allowed_actions = '"Hold", "Exit", or "Trim".'
+
+    prompt = f"""\
+You are managing an open {display} position. Review all data below and provide a
+recommendation to protect capital and optimise the trade outcome.
+{safeguard_note}
+
+=== POSITION ===
+{_fmt_position(pos, phase_info)}
+
+=== ACCOUNT ===
+{_fmt_account(account)}
+
+=== MARKET SNAPSHOT ===
+{_fmt_market_snapshot(tick, symbol)}
+
+=== TECHNICAL INDICATORS ===
+{_fmt_indicators(indicators)}
+
+=== ORIGINAL TRADE THESIS ===
+{_fmt_original_signal(original)}
+
+=== PORTFOLIO CONTEXT (other open positions) ===
+{_fmt_portfolio(portfolio, pos.get('ticket', -1))}
+
+=== RECENT MARKET CONTEXT ===
+{market_context}
+
+=== PHASE ASSESSMENT ===
+Current phase: {phase.upper()}
+{phase_block}
+
+Provide your recommendation as JSON:
+{{
+  "action": "Hold | Trim | Exit | SetSL | SetTP | SetSLTP",
+  "confidence": "High | Medium | Low",
+  "rationale": "2-3 sentences referencing specific position and market data",
+  "risk_note": "Any immediate risks to the position",
+  "suggested_sl": null,
+  "suggested_tp": null,
+  "suggested_trim_pct": null
+}}
+
+Rules:
+- Allowed actions for this phase: {allowed_actions}
+- suggested_sl / suggested_tp: float prices or null
+- suggested_trim_pct: integer 1-100 (% of position to close), or null
+- Return ONLY valid JSON, no other text."""
+
+    return prompt
+
+
+# ── LLM call ──────────────────────────────────────────────────────────────────
+
+def _call_llm(prompt: str, symbol: str) -> dict | None:
+    display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
     try:
         message = _get_client().messages.create(
             model=config.ANALYSIS_MODEL,
             max_tokens=512,
-            system=_get_system(symbol),
+            system=(
+                f"You are a professional {display} forex risk manager. "
+                "Your job is to protect open positions and optimise trade outcomes. "
+                "Be precise and reference specific numbers from the data provided."
+            ),
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
@@ -190,72 +692,197 @@ def analyze_position(pos: dict) -> dict[str, Any] | None:
 
     clean = re.sub(r"^```[a-z]*\n?", "", raw)
     clean = re.sub(r"\n?```$", "", clean).strip()
-
     try:
         result = json.loads(clean)
         if not isinstance(result, dict):
             raise ValueError("Expected JSON object")
-        result["ticket"] = pos.get("ticket")
-        result["source"] = "job2"
         return result
     except Exception as e:
         logger.error(f"Job 2 parse failed: {e}\nRaw: {raw[:500]}")
         return None
 
 
-# ── notifier integration ──────────────────────────────────────────────────────
+# ── signal builders ───────────────────────────────────────────────────────────
 
-def _build_signal_from_recommendation(pos: dict, rec: dict) -> dict[str, Any]:
-    """Convert a Job 2 recommendation into a signal dict for the notifier."""
+def _build_signal(pos: dict, rec: dict) -> dict[str, Any]:
     action = rec.get("action", "Hold")
+    symbol = pos.get("symbol", config.MT5_SYMBOL)
     return {
-        "signal": action,
-        "confidence": rec.get("confidence", "Low"),
-        "time_horizon": "Intraday",
-        "rationale": rec.get("rationale", ""),
-        "key_levels": {
-            "support": rec.get("suggested_tp") if pos.get("type") == "sell" else rec.get("suggested_sl"),
+        "signal":        action,
+        "confidence":    rec.get("confidence", "Low"),
+        "time_horizon":  "Intraday",
+        "rationale":     rec.get("rationale", ""),
+        "key_levels":    {
+            "support":    rec.get("suggested_tp") if pos.get("type") == "sell" else rec.get("suggested_sl"),
             "resistance": rec.get("suggested_sl") if pos.get("type") == "sell" else rec.get("suggested_tp"),
         },
-        "invalidation": "",
-        "risk_note": rec.get("risk_note", ""),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "_symbol": pos.get("symbol", config.MT5_SYMBOL),
-        "_ticket": pos.get("ticket"),
-        "_source": "job2",
+        "invalidation":  "",
+        "risk_note":     rec.get("risk_note", ""),
+        "generated_at":  datetime.now(timezone.utc).isoformat(),
+        "_symbol":       symbol,
+        "_ticket":       pos.get("ticket"),
+        "_source":       "job2",
+        "sl":            rec.get("suggested_sl"),
+        "tp":            rec.get("suggested_tp"),
+        "suggested_trim_pct": rec.get("suggested_trim_pct"),
     }
 
 
-def _build_trigger_from_position(pos: dict, rec: dict) -> dict[str, Any]:
-    """Build a trigger_item dict for the notifier header."""
-    direction = pos.get("type", "").upper()
-    profit = pos.get("profit", 0)
+def _build_trigger(pos: dict, rec: dict, phase_info: dict) -> dict[str, Any]:
+    direction  = pos.get("type", "").upper()
+    profit     = pos.get("profit", 0)
     profit_str = f"+${profit:.2f}" if profit >= 0 else f"-${abs(profit):.2f}"
-    action = rec.get("action", "Hold")
-    action_emoji = {"Exit": "🚨", "Trim": "✂️", "Hold": "✅"}.get(action, "")
+    action     = rec.get("action", "Hold")
+    r_str      = f" | {phase_info['current_r']:.2f}R" if phase_info["current_r"] is not None else ""
+    emoji_map  = {"Exit": "🚨", "Trim": "✂️", "Hold": "✅", "SetSL": "🔒", "SetTP": "🎯", "SetSLTP": "🔒🎯"}
     return {
         "headline": (
-            f"{action_emoji} Position Monitor — #{pos.get('ticket')} "
-            f"{direction} {pos.get('volume')}L @ {pos.get('open_price')} | P&L: {profit_str}"
+            f"{emoji_map.get(action, '')} Position Monitor — #{pos.get('ticket')} "
+            f"{direction} {pos.get('volume')}L @ {pos.get('open_price')} | "
+            f"P&L: {profit_str}{r_str} | Phase: {phase_info['phase'].upper()}"
         ),
-        "score": 8 if action == "Exit" else (6 if action == "Trim" else 4),
-        "tag": "position_monitor",
+        "score": 8 if action == "Exit" else 6 if action in ("Trim", "SetSL") else 4,
+        "tag":   "position_monitor",
     }
 
 
-# ── main scan cycle ───────────────────────────────────────────────────────────
+# ── auto-action notification ──────────────────────────────────────────────────
+
+def _notify_auto_action(pos: dict, action_type: str, old_sl: float, new_sl: float) -> None:
+    """Send a Slack notification for auto-executed SL moves."""
+    symbol = pos.get("symbol", config.MT5_SYMBOL)
+    logger.info(f"Auto {action_type} executed for #{pos.get('ticket')}: SL {old_sl} → {new_sl}")
+    try:
+        import os, requests, json as _json
+        webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+        if not webhook_url:
+            return
+        msg = (
+            f":lock: *Auto {action_type}* — #{pos.get('ticket')} "
+            f"{pos.get('type', '').upper()} {symbol}\n"
+            f">SL moved: `{old_sl}` → `{new_sl}`"
+        )
+        requests.post(
+            webhook_url,
+            data=_json.dumps({"text": msg}),
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.debug(f"Auto-action Slack notify failed: {e}")
+
+
+# ── main analysis cycle ───────────────────────────────────────────────────────
+
+def analyze_position(pos: dict, portfolio: dict) -> dict[str, Any] | None:
+    """
+    Full enriched analysis for a single open position.
+    Returns the LLM recommendation dict, or None on failure.
+    Side-effects: may auto-execute breakeven SL or trail SL.
+    """
+    symbol = pos.get("symbol", config.MT5_SYMBOL)
+    ticket = pos.get("ticket")
+
+    # 1. Original signal context
+    original = _get_original_signal(ticket)
+
+    # 2. Phase engine
+    phase_info = _compute_phase(pos, original)
+    logger.info(
+        f"#{ticket} phase={phase_info['phase']} "
+        f"R={phase_info['current_r']} "
+        f"pips={phase_info['pips_profit']:+.1f} "
+        f"overdue={phase_info['is_overdue']}"
+    )
+
+    # 3. Operational safeguards
+    spread_good, current_spread, normal_spread = _spread_ok(symbol)
+    in_blackout, blackout_event                = _in_news_blackout(symbol)
+    mods_allowed = spread_good and not in_blackout
+
+    if not spread_good:
+        logger.warning(
+            f"#{ticket} spread {current_spread}p > {normal_spread * config.JOB2_MAX_SPREAD_MULT}p "
+            f"— SL/TP modifications paused"
+        )
+    if in_blackout:
+        logger.warning(f"#{ticket} news blackout ({blackout_event}) — SL/TP modifications paused")
+
+    # 4. Auto-execute protective actions (before LLM, if safeguards pass)
+    if mods_allowed:
+        if phase_info["phase"] == PHASE_BREAKEVEN:
+            old_sl = pos.get("sl", 0.0)
+            result = _auto_breakeven(pos, phase_info)
+            if result and result.get("ok"):
+                _notify_auto_action(pos, "Breakeven", old_sl, pos.get("open_price", 0))
+
+        elif phase_info["phase"] == PHASE_TRAIL:
+            indicators_for_trail = {}
+            try:
+                from pipeline.price_agent import get_indicators
+                indicators_for_trail = get_indicators(symbol)
+            except Exception:
+                pass
+            old_sl = pos.get("sl", 0.0)
+            result = _auto_trail(pos, indicators_for_trail)
+            if result and result.get("ok"):
+                new_sl = result.get("sl", pos.get("current_price", 0.0))
+                _notify_auto_action(pos, "Trail SL", old_sl, new_sl)
+
+    # 5. Fetch indicators, market context, account, tick for LLM
+    indicators: dict = {}
+    try:
+        from pipeline.price_agent import get_indicators
+        indicators = get_indicators(symbol)
+    except Exception as e:
+        logger.warning(f"get_indicators failed for {symbol}: {e}")
+
+    account = get_account_summary()
+    tick    = get_current_tick(symbol=symbol)
+
+    try:
+        market_context = build_context(trigger_item=None, symbol=symbol)
+        market_context = market_context[:2000]
+    except Exception as e:
+        logger.warning(f"Context build failed: {e}")
+        market_context = "(market context unavailable)"
+
+    # 6. Build phase-specific prompt and call LLM
+    prompt = _build_prompt(
+        pos=pos,
+        phase_info=phase_info,
+        account=account,
+        tick=tick,
+        indicators=indicators,
+        original=original,
+        portfolio=portfolio,
+        spread_ok=spread_good,
+        in_blackout=in_blackout,
+        blackout_event=blackout_event,
+        market_context=market_context,
+    )
+
+    rec = _call_llm(prompt, symbol)
+    if rec is None:
+        return None
+
+    rec["ticket"]     = ticket
+    rec["source"]     = "job2"
+    rec["phase"]      = phase_info["phase"]
+    rec["phase_info"] = phase_info
+    return rec
+
 
 def run_position_check() -> int:
     """
-    Check all open EURUSD positions and generate recommendations.
+    Check all open positions across ACTIVE_PAIRS and generate recommendations.
     Returns number of positions checked.
     """
     if not is_connected():
         logger.warning("MT5 not connected — skipping position check")
         return 0
 
-    # Check all active pairs
-    positions = []
+    positions: list[dict] = []
     for sym in config.ACTIVE_PAIRS:
         positions.extend(get_open_positions(symbol=sym))
     if not positions:
@@ -264,28 +891,46 @@ def run_position_check() -> int:
 
     logger.info(f"=== Job 2 checking {len(positions)} position(s) ===")
 
+    # Build portfolio summary once — shared across all position analyses
+    account      = get_account_summary()
+    equity       = account.get("equity") or 10000.0
+    portfolio    = get_portfolio_summary(equity)
+
     for pos in positions:
         ticket = pos.get("ticket")
         try:
-            rec = analyze_position(pos)
+            rec = analyze_position(pos, portfolio)
             if rec is None:
                 continue
 
-            action = rec.get("action", "Hold")
+            action     = rec.get("action", "Hold")
             confidence = rec.get("confidence", "Low")
-            logger.info(f"Position #{ticket}: {action} [{confidence}]")
+            phase      = rec.get("phase", PHASE_UNKNOWN)
+            logger.info(f"Position #{ticket} [{phase}]: {action} [{confidence}]")
 
-            signal = _build_signal_from_recommendation(pos, rec)
-            trigger = _build_trigger_from_position(pos, rec)
+            signal  = _build_signal(pos, rec)
+            trigger = _build_trigger(pos, rec, rec.get("phase_info", {}))
 
-            # Save as pending signal for Job 3 (Exit and Trim require user approval)
-            # Hold with High confidence also alerts but does not require execution
+            # Route: save to signal store for approval, or just notify
             if action in ("Exit", "Trim"):
-                # Import here to avoid circular imports at module load time
+                if action == "Trim" and not _can_trim(pos):
+                    logger.warning(
+                        f"#{ticket} Trim recommended but volume too small — downgrading to Hold notify"
+                    )
+                    action = "Hold"
+                else:
+                    from pipeline.signal_store import save_pending_signal
+                    signal_id = save_pending_signal(signal, source="job2")
+                    signal["_signal_id"] = signal_id
+                    logger.info(f"Pending signal saved: {signal_id} — awaiting approval")
+
+            elif action in ("SetSL", "SetTP", "SetSLTP"):
+                # SL/TP modifications from LLM also go through approval
+                # (auto-breakeven and auto-trail already executed above without approval)
                 from pipeline.signal_store import save_pending_signal
                 signal_id = save_pending_signal(signal, source="job2")
                 signal["_signal_id"] = signal_id
-                logger.info(f"Pending signal saved: {signal_id} — awaiting approval")
+                logger.info(f"SetSL/TP signal saved: {signal_id} — awaiting approval")
 
             notify(signal, trigger_item=trigger)
 
@@ -293,6 +938,180 @@ def run_position_check() -> int:
             logger.error(f"Position check failed for #{ticket}: {e}", exc_info=True)
 
     return len(positions)
+
+
+# ── phase threshold watcher ───────────────────────────────────────────────────
+
+def _r_to_phase_simple(current_r: float) -> str:
+    """
+    Map a raw R-multiple to a phase label using only R thresholds.
+    Used by the watcher — does NOT check the overdue time condition.
+    """
+    if current_r >= config.JOB2_TRAIL_R:
+        return PHASE_TRAIL
+    if current_r >= config.JOB2_PARTIAL_TP_R:
+        return PHASE_PROFIT
+    if current_r >= config.JOB2_BREAKEVEN_R:
+        return PHASE_BREAKEVEN
+    if current_r >= 0:
+        return PHASE_EARLY
+    if current_r >= config.JOB2_LOSS_DEEP_R:
+        return PHASE_LOSS_MILD
+    return PHASE_LOSS_DEEP
+
+
+def _watcher_compute_r(pos: dict) -> float | None:
+    """
+    Compute a live R-multiple for a position using cached original_sl_pips.
+    Populates _sl_cache on first sight (from current SL — best available proxy
+    when no journal entry exists). Returns None if sl_pips cannot be determined.
+    """
+    ticket    = pos["ticket"]
+    symbol    = pos["symbol"]
+    pip       = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
+    direction = pos["type"]
+
+    # Populate cache on first sight (set once — frozen afterwards)
+    if ticket not in _sl_cache:
+        sl         = pos.get("sl") or 0.0
+        open_price = pos["open_price"]
+        if sl:
+            raw = (open_price - sl) / pip if direction == "buy" else (sl - open_price) / pip
+            sl_pips = max(0.0, raw)
+            if sl_pips > 0:
+                _sl_cache[ticket] = sl_pips
+                logger.debug(f"Watcher cached #{ticket} original_sl_pips={sl_pips:.1f}")
+
+    sl_pips = _sl_cache.get(ticket)
+    if not sl_pips:
+        return None
+
+    # Live R from current position price (already updated by MT5 in positions_get)
+    current_price = pos["current_price"]
+    open_price    = pos["open_price"]
+    pips_profit   = (
+        (current_price - open_price) / pip if direction == "buy"
+        else (open_price - current_price) / pip
+    )
+    return pips_profit / sl_pips
+
+
+def _run_phase_watch_cycle(portfolio_cache: list) -> None:
+    """
+    Single watcher cycle: check all open positions for phase transitions.
+    portfolio_cache is a 1-element list used to share the last portfolio summary
+    across cycles (avoids rebuilding it every 60 seconds unnecessarily).
+    """
+    if not is_connected():
+        return
+    if not is_forex_market_open(
+        config.MARKET_HOURS_START, config.MARKET_HOURS_END,
+        config.MARKET_CLOSE_HOUR_EST, config.MARKET_OPEN_HOUR_EST,
+    ):
+        return
+
+    positions: list[dict] = []
+    for sym in config.ACTIVE_PAIRS:
+        positions.extend(get_open_positions(symbol=sym))
+    if not positions:
+        return
+
+    now_ts       = time.time()
+    open_tickets = {pos["ticket"] for pos in positions}
+
+    # Evict closed positions from all caches
+    for ticket in list(_phase_state):
+        if ticket not in open_tickets:
+            _phase_state.pop(ticket, None)
+            _sl_cache.pop(ticket, None)
+            _last_watcher_trigger.pop(ticket, None)
+
+    for pos in positions:
+        ticket = pos["ticket"]
+        symbol = pos["symbol"]
+
+        live_r = _watcher_compute_r(pos)
+        if live_r is None:
+            continue
+
+        new_phase  = _r_to_phase_simple(live_r)
+        last_phase = _phase_state.get(ticket)
+
+        # Always update stored phase
+        _phase_state[ticket] = new_phase
+
+        # First time we see this ticket — initialise state, don't trigger
+        if last_phase is None:
+            logger.debug(f"Watcher: #{ticket} {symbol} initialised at {new_phase} (r={live_r:.2f})")
+            continue
+
+        # No phase change — nothing to do
+        if new_phase == last_phase:
+            continue
+
+        # Phase changed — check cooldown before triggering
+        last_trigger = _last_watcher_trigger.get(ticket, 0.0)
+        if (now_ts - last_trigger) < config.JOB2_PHASE_WATCH_COOLDOWN_SEC:
+            logger.debug(
+                f"Watcher: #{ticket} phase {last_phase}→{new_phase} "
+                f"(r={live_r:.2f}) suppressed — cooldown active"
+            )
+            continue
+
+        logger.info(
+            f"Watcher: #{ticket} {symbol} phase transition "
+            f"{last_phase} → {new_phase}  (r={live_r:.2f}) — triggering analysis"
+        )
+        _last_watcher_trigger[ticket] = now_ts
+
+        # Build portfolio summary (refresh at most once per cycle, reuse cached)
+        if not portfolio_cache:
+            account  = get_account_summary()
+            equity   = account.get("equity") or 10000.0
+            portfolio_cache.append(get_portfolio_summary(equity))
+        portfolio = portfolio_cache[0]
+
+        pos_snap = dict(pos)   # snapshot for the sub-thread
+
+        def _run(p=pos_snap, pf=portfolio, ph=new_phase) -> None:
+            try:
+                rec = analyze_position(p, pf)
+                if rec is None:
+                    return
+                action  = rec.get("action", "Hold")
+                signal  = _build_signal(p, rec)
+                trigger = _build_trigger(p, rec, rec.get("phase_info", {}))
+                if action == "Exit" or (action == "Trim" and _can_trim(p)):
+                    from pipeline.signal_store import save_pending_signal
+                    sid = save_pending_signal(signal, source="job2_watcher")
+                    signal["_signal_id"] = sid
+                    logger.info(f"Watcher pending signal: {sid} — {action} #{p['ticket']}")
+                notify(signal, trigger_item=trigger)
+            except Exception as e:
+                logger.error(f"Watcher analysis failed #{pos_snap['ticket']}: {e}", exc_info=True)
+
+        threading.Thread(target=_run, daemon=True, name=f"watcher-{ticket}").start()
+
+
+def run_phase_watcher_loop() -> None:
+    """
+    Background loop: polls MT5 every JOB2_PHASE_WATCH_INTERVAL_SEC seconds.
+    Triggers immediate analysis when a position crosses a phase boundary.
+    Runs alongside (not instead of) the main 30-min Job 2 loop.
+    """
+    logger.info(
+        f"Phase watcher started — "
+        f"interval: {config.JOB2_PHASE_WATCH_INTERVAL_SEC}s  "
+        f"cooldown: {config.JOB2_PHASE_WATCH_COOLDOWN_SEC}s"
+    )
+    portfolio_cache: list = []   # refreshed each cycle, shared across positions
+    while True:
+        try:
+            portfolio_cache.clear()
+            _run_phase_watch_cycle(portfolio_cache)
+        except Exception as e:
+            logger.error(f"Phase watcher cycle error: {e}", exc_info=True)
+        time.sleep(config.JOB2_PHASE_WATCH_INTERVAL_SEC)
 
 
 # ── loop ──────────────────────────────────────────────────────────────────────
@@ -320,10 +1139,16 @@ def run_job2_loop() -> None:
 
 def main() -> None:
     logger.info("=" * 60)
-    logger.info("EUR/USD Position Monitor — Job 2")
-    logger.info(f"  Analysis model  : {config.ANALYSIS_MODEL}")
-    logger.info(f"  Check interval  : {config.JOB2_CHECK_INTERVAL_MINUTES} min")
-    logger.info(f"  Symbol          : {config.MT5_SYMBOL}")
+    logger.info("EUR/USD Position Monitor — Job 2 (Phase Engine)")
+    logger.info(f"  Analysis model    : {config.ANALYSIS_MODEL}")
+    logger.info(f"  Check interval    : {config.JOB2_CHECK_INTERVAL_MINUTES} min")
+    logger.info(f"  Breakeven R       : {config.JOB2_BREAKEVEN_R}R  (buffer: {config.JOB2_BREAKEVEN_BUFFER_PIPS}p)")
+    logger.info(f"  Partial TP R      : {config.JOB2_PARTIAL_TP_R}R  ({config.JOB2_PARTIAL_TP_PCT}% trim)")
+    logger.info(f"  Trail R           : {config.JOB2_TRAIL_R}R  (ATR × {config.JOB2_TRAIL_ATR_MULT})")
+    logger.info(f"  Auto breakeven    : {config.JOB2_AUTO_BREAKEVEN}")
+    logger.info(f"  Auto trail        : {config.JOB2_AUTO_TRAIL}")
+    logger.info(f"  Spread limit      : {config.JOB2_MAX_SPREAD_MULT}× normal")
+    logger.info(f"  News blackout     : {config.JOB2_NEWS_BLACKOUT_MIN} min before event")
     logger.info("=" * 60)
 
     if not connect():

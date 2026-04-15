@@ -37,7 +37,7 @@ A Python-based AI agent that runs 24/5 (while the forex market is open) and does
 
 2. **Watches your open positions.** Every 30 minutes it reads all open MT5 positions across all active pairs and uses Claude Sonnet to recommend whether to Hold, Trim, or Exit each one based on current market conditions.
 
-3. **Executes trades.** When you approve a signal (via Slack or the command line), the agent places or closes the order on MT5 directly. Position sizing is calculated automatically from your account equity and the stop loss distance — using the correct pip value for each pair (USD-quote pairs vs JPY pairs).
+3. **Executes trades.** When you approve a signal (via Slack or the command line), the agent places or closes the order on MT5 directly. Position sizing is calculated automatically from your account equity and the stop loss distance — scaled by the signal's uncertainty score so high-conviction trades get full size and uncertain trades get reduced size. High-conviction signals (uncertainty ≤ 30) are **auto-executed without manual approval**.
 
 You stay in control. The agent never trades without your approval. Signals arrive in Slack with **clickable Execute and Reject buttons** — no typing required. You can also approve at a specific limit price (`approve XXXXXXXX limit 1.0820`), start a pair-specific chat session, and have a full conversation with the agent about market conditions — all from Slack.
 
@@ -127,9 +127,14 @@ After triggering, Job 1 sets a per-pair cooldown (default 45 minutes). EURUSD co
 
 Job 1 also runs an end-of-day collector at 22:00 UTC in a background thread: fetches closing prices and events, generates daily summary files, and cleans up old signals.
 
-### Job 2 — Position Monitor (runs every 30 minutes)
+### Job 2 — Position Monitor (runs every 30 minutes + 60-second phase watcher)
 
-Job 2 runs as a background thread alongside Job 1. It reads all open positions across all active pairs and for each position calls Claude Sonnet with:
+Job 2 runs as two coordinated background threads:
+
+- **Main loop (every 30 min):** reads all open positions and runs a full LLM analysis for each.
+- **Phase watcher (every 60 sec):** polls MT5 ticks and detects when a position crosses a phase threshold (e.g. reaches breakeven R, enters loss territory). On a transition, it immediately triggers a full analysis — bypassing the 30-minute wait. A 5-minute per-position cooldown prevents storm-triggering when price oscillates around a boundary.
+
+For each position the analysis calls Claude Sonnet with:
 - Position details: direction, volume, entry price, current P&L in dollars and pips, SL/TP levels
 - Account health: equity, balance, free margin, margin level, drawdown
 - Current market snapshot: live bid/ask, spread
@@ -155,7 +160,19 @@ Job 3 runs when you approve a signal. It routes each signal type to the correct 
 | Job 2 / Job 4 | Trim | Close partial position (default 50%) |
 | Job 4 | SetSL / SetTP / SetSLTP | Modify stop loss / take profit |
 
-For new positions (Long/Short), Job 3 calculates lot size automatically: it risks exactly `JOB3_RISK_PCT` (default 1%) of your current account equity, using the SL distance in pips. Pip values are pair-aware — USD-quote pairs (EUR/USD, GBP/USD) use $10/pip per standard lot; JPY pairs (USD/JPY) use the approximate JPY pip value configured in `config.py`.
+For new positions (Long/Short), Job 3 calculates lot size using **uncertainty-scaled risk budgeting**:
+
+1. **Base risk** — `JOB3_RISK_PCT` (default 2%) of current account equity
+2. **Uncertainty multiplier** — scaled down by the ensemble debate uncertainty score:
+
+| Uncertainty score | Conviction | Risk multiplier | Effective risk (base 2%) |
+|---|---|---|---|
+| ≤ 30 | High | 1.00× | 2.0% |
+| 31 – 55 | Medium | 0.75× | 1.5% |
+| 56 – 75 | Low (passed veto) | 0.50× | 1.0% |
+| > 75 | — | blocked (vetoed) | — |
+
+Lot = `(equity × effective_risk%) / (sl_pips × pip_value_per_lot)`, clamped to `[JOB3_MIN_LOT, JOB3_MAX_LOT]` (default 0.01 – 5.0). Pip values are pair-aware — USD-quote pairs use $10/pip per standard lot; JPY pairs use the approximate JPY pip value configured in `config.py`.
 
 ### Job 4 — Chat Assistant
 
@@ -513,6 +530,7 @@ Forex Multi-Pair Agent — Job 1
 ============================================================
 Daily collection scheduler running in background
 Job 2 position monitor starting in background
+Phase threshold watcher starting in background (interval: 60s)
 Fast news watcher starting in background (interval: 2 min)
 Slack bot starting in background
 ```
@@ -812,8 +830,13 @@ To remove a pair: remove it from `ACTIVE_PAIRS`. Everything else adapts automati
 | `TRIAGE_SCORE_THRESHOLD` | 6 | Minimum score (1–10) to trigger full analysis |
 | `COOLDOWN_MINUTES` | 45 | Per-pair silence period after a trigger fires |
 | `NEWS_MAX_AGE_HOURS` | 8 | Drop articles older than this many hours |
-| `JOB2_CHECK_INTERVAL_MINUTES` | 30 | How often Job 2 checks open positions |
-| `JOB3_RISK_PCT` | 1.0 | Percentage of equity risked per trade |
+| `JOB2_CHECK_INTERVAL_MINUTES` | 30 | How often Job 2 main loop checks open positions |
+| `JOB2_PHASE_WATCH_INTERVAL_SEC` | 60 | How often the phase watcher polls MT5 ticks for threshold crossings |
+| `JOB2_PHASE_WATCH_COOLDOWN_SEC` | 300 | Min seconds between watcher-triggered analyses per position |
+| `JOB3_RISK_PCT` | 2.0 | Base percentage of equity risked per trade (scaled down by uncertainty) |
+| `JOB3_MAX_LOT` | 5.0 | Maximum lot size cap |
+| `JOB3_UNCERTAINTY_TIERS` | see config | Tiered risk multipliers: ≤30→100%, ≤55→75%, ≤75→50% |
+| `JOB3_AUTO_APPROVE_MAX_UNCERTAINTY` | 30 | Auto-execute without approval when uncertainty ≤ this. Set to `None` to disable. |
 | `JOB3_SIGNAL_EXPIRY_MINUTES` | 60 | How long a signal stays valid before auto-expiring |
 | `MARKET_HOURS_START` / `END` | 7 / 23 | Active scanning window (UTC hour) |
 | `DAILY_COLLECTION_TIME_UTC` | `"22:00"` | When end-of-day collection runs |

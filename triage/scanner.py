@@ -134,6 +134,53 @@ def _handle_cb_updates(merged: list[dict]) -> None:
             t.start()
 
 
+def _auto_approve_signal(signal_id: str, symbol: str, uncertainty: int) -> None:
+    """
+    Background thread: connect MT5 and auto-execute a low-uncertainty signal.
+    Sends a Slack follow-up with the execution result.
+    """
+    import os, requests
+    from agents.job3_executor import approve_and_execute
+    from mt5.connector import connect as mt5_connect, is_connected
+
+    logger.info(f"[{symbol}] Auto-approving signal {signal_id} (uncertainty={uncertainty})")
+
+    if not is_connected() and not mt5_connect():
+        logger.warning(f"[{symbol}] Auto-approve: MT5 not connected — {signal_id} approved but not executed")
+        _slack_auto(f":warning: *Auto-approve failed* — MT5 not connected\nSignal `{signal_id}` approved but awaiting manual execution.")
+        return
+
+    result = approve_and_execute(signal_id)
+
+    if result.get("ok"):
+        ticket = result.get("ticket")
+        price  = result.get("price")
+        logger.info(f"[{symbol}] Auto-executed {signal_id}: ticket={ticket} price={price}")
+        _slack_auto(
+            f":robot_face: *Auto-executed* [{symbol}] `{signal_id}`\n"
+            f"Ticket: `{ticket}` | Entry: `{price}` | Uncertainty: `{uncertainty}/100`"
+        )
+    else:
+        err = result.get("error", "unknown error")
+        logger.warning(f"[{symbol}] Auto-approve execution failed: {err}")
+        _slack_auto(
+            f":x: *Auto-execute failed* [{symbol}] `{signal_id}`\n"
+            f"Reason: {err}\nSignal remains pending — approve manually."
+        )
+
+
+def _slack_auto(text: str) -> None:
+    """Send a plain Slack webhook message for auto-approval notifications."""
+    import os, requests
+    url = os.getenv("SLACK_WEBHOOK_URL", "")
+    if not url:
+        return
+    try:
+        requests.post(url, json={"text": text}, timeout=10)
+    except Exception as e:
+        logger.warning(f"Auto-approve Slack notification failed: {e}")
+
+
 def _run_cb_update(bank: str) -> None:
     try:
         from pipeline.cb_policy_updater import update_bank_policy
@@ -299,6 +346,27 @@ def _run_pair_scan(symbol: str) -> list[dict]:
             f"[{symbol}] Full analysis complete: {signal.get('signal')} "
             f"[{signal.get('confidence')}] {signal.get('time_horizon')}"
         )
+
+        # Auto-approve high-conviction Long/Short signals
+        _auto_threshold = config.JOB3_AUTO_APPROVE_MAX_UNCERTAINTY
+        if (
+            _auto_threshold is not None
+            and signal.get("signal") in ("Long", "Short")
+            and signal.get("_signal_id")
+        ):
+            unc = signal.get("uncertainty_score")
+            if unc is not None and unc <= _auto_threshold:
+                logger.info(
+                    f"[{symbol}] Uncertainty {unc} <= {_auto_threshold} — "
+                    f"auto-approving signal {signal['_signal_id']}"
+                )
+                t = threading.Thread(
+                    target=_auto_approve_signal,
+                    args=(signal["_signal_id"], symbol, unc),
+                    daemon=True,
+                    name=f"auto-approve-{signal['_signal_id']}",
+                )
+                t.start()
     except Exception as e:
         logger.error(f"[{symbol}] Full analysis pipeline failed: {e}", exc_info=True)
 

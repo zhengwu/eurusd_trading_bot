@@ -766,6 +766,59 @@ def _section_yield_spread(symbol: str) -> str:
 
 # ── public API ────────────────────────────────────────────────────────────────
 
+def get_indicators(symbol: str | None = None) -> dict:
+    """
+    Return key technical indicators as raw values for Job 2 dynamic position management.
+
+    Keys (all may be None if data unavailable):
+      atr_d1       — ATR-14 on daily bars (absolute price units)
+      rsi_d1       — RSI-14 on daily closes
+      macd_line    — MACD line (12/26/9)
+      macd_signal  — MACD signal line
+      macd_hist    — MACD histogram (positive = bullish momentum)
+      atr_m15      — ATR-14 on M15 bars (best proxy for intraday noise / trail distance)
+      rsi_m15      — RSI-14 on M15 closes
+      m15_momentum — "bullish" | "bearish" | "neutral" (last 8 bars direction vote)
+    """
+    sym  = symbol or config.MT5_SYMBOL
+    pair = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])
+    result: dict = {}
+
+    # ── Daily indicators (D1) ─────────────────────────────────────────────────
+    df_d1 = _fetch_daily(pair["yf_ticker"], period="3mo")
+    if df_d1 is not None and len(df_d1) >= 35:
+        closes = df_d1["Close"].squeeze().dropna()
+        result["atr_d1"] = _atr(df_d1, 14)
+        result["rsi_d1"] = _rsi(closes, 14)
+        macd_v = _macd(closes)
+        if macd_v:
+            result["macd_line"]   = round(macd_v[0], 6)
+            result["macd_signal"] = round(macd_v[1], 6)
+            result["macd_hist"]   = round(macd_v[2], 6)
+
+    # ── M15 indicators (intraday) ─────────────────────────────────────────────
+    bars = _m15_bars(sym)
+    if bars is not None and len(bars) >= 20:
+        closes_m15 = bars["close"]
+        df_m15 = bars.rename(columns={
+            "open": "Open", "high": "High", "low": "Low", "close": "Close"
+        })
+        result["atr_m15"] = _atr(df_m15, 14)
+        result["rsi_m15"] = _rsi(closes_m15, 14)
+
+        # Momentum vote: last 8 M15 bars
+        last8 = bars.tail(8)
+        up = int((last8["close"] > last8["open"]).sum())
+        if up >= 6:
+            result["m15_momentum"] = "bullish"
+        elif up <= 2:
+            result["m15_momentum"] = "bearish"
+        else:
+            result["m15_momentum"] = "neutral"
+
+    return result
+
+
 def get_price_summary(symbol: str | None = None) -> str:
     """
     Build a detailed price summary for the given symbol.

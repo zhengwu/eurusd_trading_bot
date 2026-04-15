@@ -102,6 +102,22 @@ def _job2_thread() -> None:
         mt5_disconnect()
 
 
+def _phase_watcher_thread() -> None:
+    """Background thread: connect to MT5 and run the phase threshold watcher."""
+    from agents.job2_position import run_phase_watcher_loop
+
+    logger.info("Phase watcher: connecting to MT5...")
+    if not mt5_connect():
+        logger.warning("Phase watcher: MT5 connection failed — phase watcher will not run")
+        return
+    try:
+        run_phase_watcher_loop()
+    except Exception as e:
+        logger.error(f"Phase watcher thread crashed: {e}", exc_info=True)
+    finally:
+        mt5_disconnect()
+
+
 def main() -> None:
     _disable_quickedit()
     logger.info("=" * 60)
@@ -142,6 +158,18 @@ def main() -> None:
     )
     j2_thread.start()
     logger.info("Job 2 position monitor starting in background")
+
+    # Start phase threshold watcher in background thread
+    pw_thread = threading.Thread(
+        target=_phase_watcher_thread,
+        daemon=True,
+        name="phase-watcher",
+    )
+    pw_thread.start()
+    logger.info(
+        f"Phase threshold watcher starting in background "
+        f"(interval: {config.JOB2_PHASE_WATCH_INTERVAL_SEC}s)"
+    )
 
     # Start fast news watcher (2-min RSS poll) in background thread
     from pipeline.fast_news_watcher import run_fast_watcher_loop
