@@ -293,15 +293,29 @@ def _run_pair_scan(symbol: str) -> list[dict]:
                 except Exception as e:
                     logger.error(f"[{symbol}] Ensemble debate failed: {e}", exc_info=True)
 
-            # Recommend position size based on remaining portfolio risk + uncertainty
+            # Recommend position size based on remaining portfolio risk + uncertainty.
+            # Use the debate-adjusted SL (signal["sl"]) when available — the judge may
+            # have widened a dangerously tight stop, which would otherwise produce an
+            # inflated lot from the pre-debate preview's sl_pips.
             try:
-                from mt5.risk_manager import recommend_position_size
-                from mt5.position_reader import get_account_summary
+                from mt5.risk_manager import recommend_position_size, sl_pips_from_price
+                from mt5.position_reader import get_account_summary, get_current_tick
                 from mt5.connector import is_connected
                 if is_connected():
-                    acct    = get_account_summary()
-                    equity  = acct.get("equity") or 0.0
-                    sl_pips = (preview or {}).get("sl_pips") or config.JOB3_DEFAULT_SL_PIPS
+                    acct      = get_account_summary()
+                    equity    = acct.get("equity") or 0.0
+                    direction = "buy" if signal.get("signal") == "Long" else "sell"
+                    # Prefer debate-adjusted SL for pip calculation; fall back to preview
+                    if signal.get("sl"):
+                        tick          = get_current_tick(symbol=symbol)
+                        current_price = (tick["ask"] if direction == "buy" else tick["bid"]) if tick else None
+                        if current_price:
+                            sl_pips = sl_pips_from_price(float(signal["sl"]), current_price, direction, symbol)
+                        else:
+                            sl_pips = (preview or {}).get("sl_pips") or config.JOB3_DEFAULT_SL_PIPS
+                    else:
+                        sl_pips = (preview or {}).get("sl_pips") or config.JOB3_DEFAULT_SL_PIPS
+                    sl_pips = sl_pips if sl_pips >= 1 else config.JOB3_DEFAULT_SL_PIPS
                     unc     = signal.get("uncertainty_score") or signal.get("_uncertainty_score")
                     sizing  = recommend_position_size(unc, equity, sl_pips, symbol=symbol)
                     signal["_lot_override"]         = sizing["lot"]
@@ -310,7 +324,8 @@ def _run_pair_scan(symbol: str) -> list[dict]:
             except Exception as e:
                 logger.warning(f"[{symbol}] Position sizing recommendation failed (non-fatal): {e}")
 
-            # Recompute preview with recommended lot (and any judge-adjusted SL/TP)
+            # Recompute preview with recommended lot AND debate-adjusted SL/TP.
+            # calculate_sl_tp() now prefers signal["sl"]/signal["tp"] over key_levels.
             updated_preview = compute_order_preview(signal, symbol=symbol)
             if updated_preview:
                 signal["_order_preview"] = updated_preview

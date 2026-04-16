@@ -174,37 +174,50 @@ def calculate_sl_tp(
     direction: "buy" or "sell"
     Returns (sl_price, tp_price) — either may be None if calculation fails.
     """
-    levels = signal.get("key_levels") or {}
-    support = levels.get("support")
-    resistance = levels.get("resistance")
-
     sl_price: float | None = None
     tp_price: float | None = None
 
-    if direction == "buy":
-        # SL below support, TP at resistance
-        if support is not None:
-            try:
-                sl_price = float(support)
-            except (TypeError, ValueError):
-                pass
-        if resistance is not None:
-            try:
-                tp_price = float(resistance)
-            except (TypeError, ValueError):
-                pass
-    else:  # sell
-        # SL above resistance, TP at support
-        if resistance is not None:
-            try:
-                sl_price = float(resistance)
-            except (TypeError, ValueError):
-                pass
-        if support is not None:
-            try:
-                tp_price = float(support)
-            except (TypeError, ValueError):
-                pass
+    # Prefer debate-adjusted SL/TP written directly onto the signal by the judge.
+    # Fall back to key_levels (original LLM output) if not present.
+    try:
+        if signal.get("sl") is not None:
+            sl_price = float(signal["sl"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if signal.get("tp") is not None:
+            tp_price = float(signal["tp"])
+    except (TypeError, ValueError):
+        pass
+
+    # key_levels fallback for any value not already set by the judge
+    if sl_price is None or tp_price is None:
+        levels = signal.get("key_levels") or {}
+        support    = levels.get("support")
+        resistance = levels.get("resistance")
+
+        if direction == "buy":
+            if sl_price is None and support is not None:
+                try:
+                    sl_price = float(support)
+                except (TypeError, ValueError):
+                    pass
+            if tp_price is None and resistance is not None:
+                try:
+                    tp_price = float(resistance)
+                except (TypeError, ValueError):
+                    pass
+        else:  # sell
+            if sl_price is None and resistance is not None:
+                try:
+                    sl_price = float(resistance)
+                except (TypeError, ValueError):
+                    pass
+            if tp_price is None and support is not None:
+                try:
+                    tp_price = float(support)
+                except (TypeError, ValueError):
+                    pass
 
     sym = symbol or config.MT5_SYMBOL
     pip = _pip(sym)
