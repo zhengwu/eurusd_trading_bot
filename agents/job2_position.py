@@ -191,6 +191,8 @@ def _compute_phase(pos: dict, original: dict | None) -> dict:
 
     # Original SL distance — needed to compute R-multiple
     original_sl_pips: float | None = None
+
+    # 1. Journal lookup (most accurate — actual SL recorded at execution time)
     if original:
         try:
             actual_sl    = float(original.get("actual_sl") or 0)
@@ -203,7 +205,13 @@ def _compute_phase(pos: dict, original: dict | None) -> dict:
         except Exception:
             pass
 
-    # Fall back: infer from current SL if available and trade is early
+    # 2. In-memory watcher cache (frozen at first sight — survives SL modifications
+    #    such as breakeven or trail moves that would corrupt the current-SL fallback)
+    ticket = pos.get("ticket")
+    if not original_sl_pips and ticket and ticket in _sl_cache:
+        original_sl_pips = _sl_cache[ticket]
+
+    # 3. Current SL fallback — only reliable before any SL modifications
     if not original_sl_pips and sl:
         if direction == "buy":
             original_sl_pips = max(0.0, (open_price - sl) / pip)
@@ -322,9 +330,10 @@ def _auto_breakeven(pos: dict, phase_info: dict) -> dict | None:
         config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["price_decimals"],
     )
 
+    sign = "+" if direction == "buy" else "-"
     logger.info(
         f"Auto-breakeven #{pos.get('ticket')}: SL → {new_sl} "
-        f"(entry {entry} + {config.JOB2_BREAKEVEN_BUFFER_PIPS}p buffer)"
+        f"(entry {entry} {sign} {config.JOB2_BREAKEVEN_BUFFER_PIPS}p buffer)"
     )
     return modify_sl_tp(pos["ticket"], sl=new_sl, tp=current_tp)
 
@@ -814,7 +823,8 @@ def analyze_position(pos: dict, portfolio: dict) -> dict[str, Any] | None:
             old_sl = pos.get("sl", 0.0)
             result = _auto_breakeven(pos, phase_info)
             if result and result.get("ok"):
-                _notify_auto_action(pos, "Breakeven", old_sl, pos.get("open_price", 0))
+                new_sl = result.get("sl", pos.get("open_price", 0))
+                _notify_auto_action(pos, "Breakeven", old_sl, new_sl)
 
         elif phase_info["phase"] == PHASE_TRAIL:
             indicators_for_trail = {}
