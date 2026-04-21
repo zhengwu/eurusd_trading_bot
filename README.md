@@ -35,7 +35,7 @@ A Python-based AI agent that runs 24/5 (while the forex market is open) and does
 
 1. **Reads the news.** A fast news watcher polls RSS feeds every 2 minutes for breaking headlines; the main scanner runs every 30 minutes across all providers. Headlines are scored 1–10 using a two-pass triage system (Azure GPT-5.2 for both passes, Claude Haiku fallback), and — when something important is detected — runs a deep analysis using Claude Sonnet to generate a trading signal (Long, Short, or Wait). Each pair has its own news queries, cooldown timer, and deduplication cache so they never interfere with each other.
 
-2. **Watches your open positions.** Every 30 minutes it reads all open MT5 positions across all active pairs and uses Claude Sonnet to recommend whether to Hold, Trim, or Exit each one based on current market conditions.
+2. **Watches your open positions.** Every 30 minutes it runs a cheap two-tier check across all open positions: a compact Azure GPT-5.2 (or Haiku fallback) assessment of indicators, session prices, and recent news for each position. Routine Hold results send a compact one-liner to Slack. If the cheap model flags Exit with High confidence, it escalates to a full Claude Sonnet analysis automatically. Phase transitions (breakeven, entering loss territory, hitting trail R) always trigger full Sonnet analysis immediately — bypassing the 30-minute wait. At every non-loss phase the monitor also runs a **theory invalidation check**: if the macro catalyst that opened the trade has been definitively reversed by news or price action, it forces an Exit regardless of the current phase.
 
 3. **Executes trades.** When you approve a signal (via Slack or the command line), the agent places or closes the order on MT5 directly. Position sizing is calculated automatically after the ensemble debate: the remaining portfolio risk budget (total cap minus currently deployed risk) is allocated to the new trade, scaled down by the signal's uncertainty score so high-conviction trades get more of the remaining budget and uncertain trades get less. The sizing rationale is shown in the Slack alert. High-conviction signals (uncertainty ≤ 30) are **auto-executed without manual approval**.
 
@@ -132,20 +132,37 @@ Job 1 also runs an end-of-day collector at 22:00 UTC in a background thread: fet
 
 Job 2 runs as two coordinated background threads:
 
-- **Main loop (every 30 min):** reads all open positions and runs a full LLM analysis for each.
-- **Phase watcher (every 60 sec):** polls MT5 ticks and detects when a position crosses a phase threshold (e.g. reaches breakeven R, enters loss territory). On a transition, it immediately triggers a full analysis — bypassing the 30-minute wait. A 5-minute per-position cooldown prevents storm-triggering when price oscillates around a boundary.
+- **Main loop (every 30 min):** reads all open positions and runs a two-tier analysis for each.
+- **Phase watcher (every 60 sec):** polls MT5 ticks and detects when a position crosses a phase threshold (e.g. reaches breakeven R, enters loss territory). On a transition, it immediately triggers a full Sonnet analysis — bypassing the 30-minute wait. A 5-minute per-position cooldown prevents storm-triggering when price oscillates around a boundary.
 
-For each position the analysis calls Claude Sonnet with:
-- Position details: direction, volume, entry price, current P&L in dollars and pips, SL/TP levels
-- Account health: equity, balance, free margin, margin level, drawdown
-- Current market snapshot: live bid/ask, spread
-- Recent market context for the position's pair
+#### Two-tier LLM analysis
 
-Claude returns one of three recommendations:
+**Routine checks (Azure GPT-5.2 / Haiku fallback):** Every 30-minute pass uses a compact prompt that includes technical indicators, today's session prices, and the last 6 scored headlines for the pair. The model assesses indicator alignment, news impact, and phase fit and returns a `reasoning_summary` (auditable chain-of-thought) plus an action. If it recommends Exit with High confidence, it automatically escalates to full Sonnet.
 
-- **Hold** — position is on track; informational alert only, no approval needed.
-- **Trim** — risk/reward has deteriorated but direction still valid; partially close.
-- **Exit** — original thesis is broken; close the full position.
+**Priority analysis (Claude Sonnet):** Fires on phase transitions (watcher) or escalation from the routine check. Uses a targeted context block — last 8 scored headlines, released economic events with actual/forecast/surprise, and session prices — rather than the full signal-generation context. Includes a **theory invalidation cross-cutting check** at every non-loss phase: if the macro catalyst that opened the trade has been definitively reversed (e.g., original thesis was ECB hawkish hold → ECB just cut unexpectedly), the model forces an Exit overriding any phase-based Hold recommendation.
+
+#### Phase engine (hard rules, no LLM)
+
+Nine phases based on the R-multiple (`pips_in_profit / original_sl_pips`):
+
+| Phase | Trigger | Auto-action |
+|-------|---------|-------------|
+| LOSS_CRITICAL | R < loss_deep threshold | None — LLM makes binary Exit/Hold call |
+| LOSS_DEEP | loss_deep ≤ R < loss_moderate | None — LLM may suggest partial close |
+| LOSS_MODERATE | loss_moderate ≤ R < loss_mild | None — LLM reviews thesis |
+| LOSS_MILD | loss_mild ≤ R < 0 | None — normal noise, LLM monitors |
+| EARLY | 0 ≤ R < breakeven | None |
+| BREAKEVEN | R ≥ JOB2_BREAKEVEN_R | Move SL to entry + 3p buffer |
+| PROFIT | R ≥ JOB2_PARTIAL_TP_R | None — LLM asked about trimming |
+| TRAIL | R ≥ JOB2_TRAIL_R | Trail SL at ATR-M15 × 1.5 |
+| OVERDUE | hours_open > 1.5× expected horizon | None |
+
+#### Notification routing
+
+- **Routine Hold** → compact one-liner (reduces Slack noise for uneventful checks)
+- **Priority Hold / Exit / Trim / SetSL** → full Slack alert with ⚡ priority badge or 🕐 routine badge
+- **Theory-driven Exit** → 💡🚨 badge, prefixed with `[THESIS INVALIDATED]` in rationale
+- **Auto breakeven / trail** → 🔒 notification, no approval needed
 
 Trim and Exit signals are saved as pending and posted to Slack for your approval.
 
@@ -181,9 +198,16 @@ Lot is clamped to `[JOB3_MIN_LOT, JOB3_MAX_LOT]` (default 0.01–5.0). Pip value
 
 If the portfolio risk data is unavailable (e.g. MT5 offline when the signal was generated), Job 3 falls back to flat `JOB3_RISK_PCT` (2%) with no uncertainty scaling. The portfolio risk gate still applies at execution time.
 
-**Minimum R:R gate.** Before placing any order, Job 3 computes `R:R = TP distance / SL distance` from live prices. If R:R < `JOB3_MIN_RR` (default 1.0), the signal is rejected — even if already approved. The analysis prompt enforces the same threshold upstream: the model scans the nearest 2–3 significant structural levels for TP and uses the closest one that meets the R:R requirement. If none do, it outputs `Wait` with `wait_reason=rr_insufficient` logged to Slack and the scanner log.
+**R:R thresholds — two levels with distinct roles.**
+
+- **`JOB3_RR_WARNING` (default 1.5) — soft warning.** When the computed R:R falls below this, a ⚠️ is shown on the Slack order preview and the analysis prompt instructs the model to flag it in `risk_note`. The trade can still be approved and executed.
+- **`JOB3_MIN_RR` (default 0.5) — hard execution block.** Before placing any order, Job 3 computes `R:R = TP distance / SL distance` from live prices. If R:R < `JOB3_MIN_RR`, the signal is rejected outright — even if already approved. This blocks only genuinely negative-edge setups.
+
+The analysis prompt (step 7) instructs the model to scan 2–3 structural TP levels and always aim to produce a tradeable Long or Short. R:R alone no longer blocks signal generation — low R:R only triggers a warning in `risk_note`.
 
 **Auto-execution.** After sizing, signals with `uncertainty_score ≤ JOB3_AUTO_APPROVE_MAX_UNCERTAINTY` (default 30) are automatically approved and executed in a background thread. Slack receives a confirmation with the MT5 ticket and fill price. Set `JOB3_AUTO_APPROVE_MAX_UNCERTAINTY = None` to require manual approval for all signals.
+
+**Continuation signal detection.** When a new signal is generated while an open position already exists on the same pair, the full analysis LLM is shown the open position's original thesis (from the trade journal) and must classify the new signal as `continuation` (same direction, same macro thesis) or `new_theory` (different direction or a distinct catalyst). Continuation signals are never auto-executed — they are sent to Slack with a `:link:` badge and a "manual approval required" note. This prevents the agent from doubling into a position based on news that merely restates the original catalyst.
 
 ### Job 4 — Chat Assistant
 
@@ -270,7 +294,7 @@ Sizing: 0.8% of 3.0% portfolio risk in use (2.2% remaining). High conviction (un
 [ 📈 Execute Long ]  [ ✕ Reject ]
 ```
 
-When R:R falls below 1.5, an inline ⚠️ warning appears on the order line. The debate header reflects what actually happened: `Confirmed Long`, `Direction flipped to Short`, `Proceeded with caution`, or `VETOED`.
+When R:R falls below `JOB3_RR_WARNING` (default 1.5), an inline ⚠️ warning appears on the order line. The debate header reflects what actually happened: `Confirmed Long`, `Direction flipped to Short`, `Proceeded with caution`, or `VETOED`.
 
 ### Position debate (Hold / Trim / Exit → Judge)
 
@@ -667,7 +691,7 @@ Risk Note: Fed speakers at 15:00 UTC could reverse USD weakness
 
 Order Details (live)
 Entry 1.2743  SL 1.2680 (-63p)  TP 1.2820 (+77p)
-Lot 0.12  Risk $100  R:R 1:1.2  ⚠️ R:R below 1.5
+Lot 0.12  Risk $100  R:R 1:1.2  ⚠️ R:R below 1.5 (JOB3_RR_WARNING)
 
 Ensemble Debate — Confirmed Long (uncertainty 42/100)
 📈 Bull 68 | 📉 Bear 44 | Winner: Bull
@@ -849,7 +873,8 @@ To remove a pair: remove it from `ACTIVE_PAIRS`. Everything else adapts automati
 | `JOB3_MAX_LOT` | 5.0 | Maximum lot size cap |
 | `JOB3_UNCERTAINTY_TIERS` | see config | Tiered risk multipliers: ≤30→100%, ≤55→75%, ≤75→50% |
 | `JOB3_AUTO_APPROVE_MAX_UNCERTAINTY` | 30 | Auto-execute without approval when uncertainty ≤ this. Set to `None` to disable. |
-| `JOB3_MIN_RR` | 1.0 | Minimum R:R (TP÷SL) to execute. Signals below this are blocked at execution and filtered in the analysis prompt. Raise to 1.2–1.5 once win-rate data is available. |
+| `JOB3_MIN_RR` | 0.5 | Hard execution block — signals below this R:R are rejected even if approved. |
+| `JOB3_RR_WARNING` | 1.5 | Soft warning threshold — ⚠️ shown in Slack preview and model flags in `risk_note`. No execution block. |
 | `JOB3_SIGNAL_EXPIRY_MINUTES` | 60 | How long a signal stays valid before auto-expiring |
 | `MARKET_HOURS_START` / `END` | 7 / 23 | Active scanning window (UTC hour) |
 | `DAILY_COLLECTION_TIME_UTC` | `"22:00"` | When end-of-day collection runs |

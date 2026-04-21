@@ -3,21 +3,40 @@
 Monitors open positions via MT5 and applies a two-layer decision process:
 
   Layer 1 — Phase Engine (hard rules, no LLM):
-    Determines the current phase of each trade from objective data:
-      Phase 0 EARLY     — trade not yet at breakeven threshold, just monitor
-      Phase 1 BREAKEVEN — trade reached JOB2_BREAKEVEN_R; move SL to entry + buffer
-      Phase 2 PROFIT    — trade reached JOB2_PARTIAL_TP_R; suggest trim
-      Phase 3 TRAIL     — trade reached JOB2_TRAIL_R; trail SL at ATR distance
-      Phase 4 OVERDUE   — trade open longer than expected horizon; tighten/exit
-    Auto-executes protective actions (breakeven SL, trail update) without approval.
+    Determines the current phase of each trade from objective data.
+    Loss phases (negative R):
+      LOSS_CRITICAL — near SL (R < JOB2_LOSS_DEEP_R); binary Exit/Hold decision
+      LOSS_DEEP     — deep loss; partial close eligible to reduce dollar risk
+      LOSS_MODERATE — early warning; thesis review triggered
+      LOSS_MILD     — normal noise range; monitor
+    Profit / neutral phases:
+      EARLY     — 0 ≤ R < JOB2_BREAKEVEN_R; monitor
+      BREAKEVEN — reached JOB2_BREAKEVEN_R; move SL to entry + buffer
+      PROFIT    — reached JOB2_PARTIAL_TP_R; suggest trim
+      TRAIL     — R ≥ JOB2_TRAIL_R; trail SL at ATR distance
+      OVERDUE   — open longer than expected horizon; tighten/exit
+    Auto-executes breakeven SL move and trail SL updates without approval.
 
-  Layer 2 — LLM Judgment (Claude Sonnet):
-    Given the phase context, enriched position data, and market indicators,
-    the LLM answers phase-specific questions:
-      Phase 0/1 — Is the thesis still valid? Any early exit signals?
-      Phase 2   — Should we trim 33%, 50%, or hold for a bigger move?
-      Phase 3   — Is momentum still supporting the trend, or should we tighten faster?
-      Phase 4   — Is there any reason to hold past the expected horizon, or exit now?
+  Layer 2 — Two-tier LLM Judgment:
+    Routine 30-min checks use a cheap model (Azure GPT-5.2, Haiku fallback):
+      - Compact prompt (~600 tokens): position + indicators + session price +
+        last 6 scored headlines + structured assessment approach
+      - JSON output includes reasoning_summary for auditability
+      - If action=Exit AND confidence=High: escalates to full Sonnet analysis
+      - Hold result → compact one-liner Slack notification (low noise)
+
+    Priority triggers (phase transitions, escalations) use Claude Sonnet:
+      - Full enriched prompt: position + account + tick + indicators +
+        original thesis + portfolio context + targeted news context
+        (last 8 headlines + released events + session prices — NOT the generic
+        signal-generation context)
+      - Theory invalidation cross-cutting check: fires at every non-loss phase.
+        If thesis is definitively broken (macro event reversed catalyst, price
+        closed convincingly beyond stated invalidation level), forces action=Exit
+        regardless of phase-based logic.
+      - Loss phases ask about thesis validity inline; dedicated invalidation section
+        suppressed there to avoid double-prompting.
+      - Full Slack alert with priority badge.
 
 Operational safeguards (checked before any SL/TP modification):
   - Spread must be within JOB2_MAX_SPREAD_MULT × normal_spread_pips
@@ -26,8 +45,9 @@ Operational safeguards (checked before any SL/TP modification):
 
 Signal routing:
   Auto-execute (no approval):  breakeven SL move, trail SL update
-  Approval required:           Trim, Exit, suggested new TP
-  Notify only:                 Hold recommendations
+  Approval required:           Trim, Exit, suggested new TP/SL
+  Notify only — compact:       Routine Hold (one-liner)
+  Notify only — full alert:    Priority Hold, theory-driven exit, escalated results
 
 Usage (standalone):
     conda activate mt5_env

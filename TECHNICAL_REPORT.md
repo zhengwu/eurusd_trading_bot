@@ -1,6 +1,6 @@
 # Technical Report: Forex Multi-Pair AI Trading Agent
 
-**Version:** April 2026 (updated 2026-04-15)  
+**Version:** April 2026 (updated 2026-04-21)  
 **Pairs:** EUR/USD · GBP/USD · USD/JPY  
 **Platform:** Windows / MetaTrader 5 / Python 3.11
 
@@ -531,12 +531,10 @@ ANALYTICAL PROCESS — follow this order:
 5. ENTRY PRECISION: Use H4 EMA 20/50 and M15 structure for entry zone.
 6. STOP LOSS RULE: Never place SL at an obvious level. Pad by at least 1×ATR-14 (D1) beyond
    the nearest key level. Wider SL in high-volatility regimes.
-7. RISK:REWARD RULE: Only output Long or Short if TP distance >= {min_rr}× SL distance
-   (R:R >= 1:{min_rr}). Scan the nearest 2-3 significant technical levels ahead of price
-   (swing highs/lows, SMAs, Bollinger midline, round numbers, prev day H/L) and use the closest
-   one that satisfies the R:R requirement. Do NOT invent levels — every TP must correspond to a
-   named structure visible in the price data. If no meaningful level within 2× ATR-14 satisfies
-   R:R >= 1:{min_rr}, output Wait.
+7. RISK/REWARD CHECK: Scan 2-3 structural TP levels and pick the one that gives the best
+   executable R:R. Always aim to produce a tradeable Long or Short. If the best available R:R
+   is below 1:{rr_warning}, still output the signal but flag it in risk_note with a warning
+   such as "⚠ R:R X.X below {rr_warning} threshold — size down or monitor closely".
 
 {context_window}
 
@@ -549,7 +547,7 @@ complete the analytical fields first to build your thesis, THEN output the signa
   "mtf_confluence": "D1/H4/M15 trend directions and ALIGNED/LEANING/CONFLICTED verdict",
   "technical_rationale": "Full TA picture: MTF structure, MACD, Bollinger, H4 EMA, key levels",
   "signal": "Long | Short | Wait",
-  "wait_reason": "ONLY populate if signal=Wait. Primary reason: 'rr_insufficient', 'mtf_conflicted', 'macro_unclear', or 'risk_event_pending'. Include a 1-sentence explanation. Empty string for Long/Short.",
+  "wait_reason": "ONLY populate if signal=Wait. Primary reason: 'mtf_conflicted', 'macro_unclear', or 'risk_event_pending'. Include a 1-sentence explanation. Empty string for Long/Short.",
   "confidence": "High | Medium | Low",
   "time_horizon": "Intraday | 1-3 days | This week",
   "trade_setup": {
@@ -578,13 +576,34 @@ complete the analytical fields first to build your thesis, THEN output the signa
 Return ONLY valid JSON, no other text.
 ```
 
-**`wait_reason` field:** When the signal is `Wait`, the model must identify the primary reason using one of four categories: `rr_insufficient` (no structural TP level within 2×ATR satisfies the R:R threshold), `mtf_conflicted` (D1/H4/M15 alignment verdict is CONFLICTED), `macro_unclear` (no clear directional catalyst), or `risk_event_pending` (high-impact event imminent). This field is passed through `signal_formatter.py` and logged by the scanner — enabling ongoing diagnosis of why setups are being filtered without changing any thresholds.
+**`wait_reason` field:** When the signal is `Wait`, the model must identify the primary reason using one of three categories: `mtf_conflicted` (D1/H4/M15 alignment verdict is CONFLICTED), `macro_unclear` (no clear directional catalyst), or `risk_event_pending` (high-impact event imminent). R:R no longer blocks signal generation — low R:R only triggers a warning in `risk_note`. This field is passed through `signal_formatter.py`, shown in Slack notifications for Wait signals, and logged by the scanner.
+
+### Continuation signal classification
+
+When an open position already exists on the pair being analysed, `triage/scanner.py` calls `analysis/context_builder.get_open_position_theories(symbol)` before running full analysis. This function:
+- Reads all open MT5 positions for the symbol
+- Cross-references each ticket against `data/trade_journal.jsonl` to retrieve the original rationale and invalidation condition
+- Builds an `=== OPEN POSITIONS ===` context block showing entry price, SL/TP, unrealised P&L, and the original thesis for each position
+
+The full analysis LLM receives this block and must classify each new signal:
+
+| Classification | Conditions |
+|---|---|
+| `continuation` | Same direction AND macro/technical thesis is materially the same as an existing position |
+| `new_theory` | Different direction OR a distinct catalyst (e.g. existing thesis: ECB hold; new signal: US CPI surprise) |
+
+When the scanner receives `theory_classification = "continuation"`:
+- Sets `signal["_is_continuation"] = True` and `signal["_related_ticket"]`
+- **Auto-execution is suppressed** — continuation signals always require manual approval regardless of uncertainty score
+- Slack notification shows a `:link:` badge and "Theory: Continuation of open position (ticket #X), manual approval required"
+
+This prevents the agent from inadvertently doubling a position on news that merely restates the original catalyst, while still surfacing the signal for the trader to evaluate.
 
 ### Signal output
 
-The signal formatter (`analysis/signal_formatter.py`) normalises the raw JSON into a standardised dict with fields: `signal`, `confidence`, `time_horizon`, `today_summary`, `key_levels`, `price_snapshot`, `invalidation`, `risk_note`, `wait_reason`, etc.
+The signal formatter (`analysis/signal_formatter.py`) normalises the raw JSON into a standardised dict with fields: `signal`, `confidence`, `time_horizon`, `today_summary`, `key_levels`, `price_snapshot`, `invalidation`, `risk_note`, `wait_reason`, `theory_classification`, `related_ticket`, etc.
 
-Only `Long` and `Short` signals proceed to the ensemble debate and order preview. `Wait` signals are notified to Slack and logged with their `wait_reason`. The scanner appends `wait_reason` to the info log line (e.g. `Full analysis complete: Wait [Medium] Intraday | wait_reason=rr_insufficient — ...`) for ongoing signal quality diagnosis.
+Only `Long` and `Short` signals proceed to the ensemble debate and order preview. `Wait` signals are notified to Slack (with the `wait_reason` shown if populated) and logged by the scanner.
 
 ---
 
@@ -903,7 +922,7 @@ The result is attached to the signal as `_lot_override` (lot) and `_size_reason`
 | `lot_size` | `_lot_override` if set, else `calculate_lot_size(base_risk)` |
 | `risk_amount` | `equity × _recommended_risk_pct` (or `JOB3_RISK_PCT`) |
 | `risk_reward` | `tp_pips / sl_pips` |
-| `rr_warning` | `True` when R:R < 1.5 |
+| `rr_warning` | `True` when R:R < `config.JOB3_RR_WARNING` (default 1.5) |
 
 The preview is stored on the signal as `_order_preview` and rendered in the Slack notification. The sizing rationale appears as an italic line beneath the lot/risk line:
 
@@ -931,10 +950,10 @@ Set `JOB3_AUTO_APPROVE_MAX_UNCERTAINTY = None` in `config.py` to disable auto-ex
 ## 9. Pipeline 7 — Position Monitor (Dynamic Position Management)
 
 **File:** `agents/job2_position.py`  
-**Model:** Claude Sonnet (`claude-sonnet-4-6`)  
-**Interval:** Every `JOB2_CHECK_INTERVAL_MINUTES` (default: 30 min)
+**Models:** Azure GPT-5.2 (routine checks, Haiku fallback) + Claude Sonnet (priority analysis)  
+**Interval:** Every `JOB2_CHECK_INTERVAL_MINUTES` (default: 30 min) + 60-second phase watcher
 
-Job 2 applies a two-layer decision process to every open position — a hard-rules phase engine first, then a focused LLM prompt tailored to that phase.
+Job 2 applies a two-layer decision process to every open position — a hard-rules phase engine first, then a two-tier LLM prompt tailored to that phase.
 
 ### Two-layer architecture
 
@@ -950,35 +969,60 @@ Open position (MT5)
       ▼
 [Phase Engine — hard rules, no LLM]
   Computes: R-multiple, time-in-trade, breakeven status, net P&L (profit + swap)
-  Assigns one of 5 phases based on objective thresholds
+  Assigns one of 9 phases based on objective thresholds
       │
       ├── BREAKEVEN / TRAIL phase + safeguards OK?
       │       → Auto-execute SL modification (no approval)
       │       → Notify Slack
       │
       ▼
-[LLM Judgment — phase-specific prompt]
-  Context: enriched position data + live indicators + original signal thesis
-           + portfolio exposure context
-  Question: phase-specific (see phase table below)
-      │
-      ├── Exit / Trim      → save to signal_store, Slack approval required
-      ├── SetSL / SetTP    → save to signal_store, Slack approval required
-      └── Hold             → Slack notification only
+[Two-tier LLM Judgment]
+
+  ┌─ Routine (every 30 min) ───────────────────────────────────┐
+  │  Model: Azure GPT-5.2 (Haiku fallback)                     │
+  │  Prompt: position + indicators + session prices +          │
+  │          last 6 headlines + structured assessment approach  │
+  │  Output: reasoning_summary + action + confidence           │
+  │                                                             │
+  │  action=Exit AND confidence=High?                           │
+  │    yes → escalate to full Sonnet analysis                   │
+  │    no  → Hold: compact one-liner Slack notification        │
+  │          Exit/Trim: save pending, full Slack alert          │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ Priority (phase transitions, escalations) ────────────────┐
+  │  Model: Claude Sonnet (ANALYSIS_MODEL)                      │
+  │  Prompt: position + account + tick + indicators +           │
+  │          original thesis + portfolio context +              │
+  │          targeted news context (_build_job2_news_context):  │
+  │            last 8 headlines + released events + 5 assets   │
+  │  Non-loss phases: theory invalidation check (see below)    │
+  │  Output: action + confidence + rationale + suggested SL/TP │
+  │                                                             │
+  │  theory_invalidated=true → force Exit regardless of phase  │
+  │  Exit / Trim → save pending, full Slack alert              │
+  │  Hold → full Slack alert with ⚡ priority badge            │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ### Phase engine
 
+Nine phases, ordered from most adverse to most profitable:
+
 | Phase | Trigger condition | Auto-action | LLM question |
 |-------|------------------|-------------|--------------|
-| **EARLY** | `current_r < 1.0` | None | Is thesis still valid? Any early exit signals? |
-| **BREAKEVEN** | `1.0 ≤ r < 1.5` | Move SL to `entry + 3p buffer` (if safeguards pass) | Is the move stalling or continuing? Hold or exit while in profit? |
-| **PROFIT** | `1.5 ≤ r < 2.0` | None | Trim 33/50/75% or hold for bigger target? Momentum exhaustion? |
-| **TRAIL** | `r ≥ 2.0` | Trail SL at `1.5 × ATR-M15` behind price (never backwards) | Is momentum still strong enough to trail, or take full profit? |
+| **LOSS_CRITICAL** | `r < JOB2_LOSS_DEEP_R` (near SL) | None | Binary Exit/Hold — thesis broken or directional move? |
+| **LOSS_DEEP** | `JOB2_LOSS_DEEP_R ≤ r < JOB2_LOSS_MODERATE_R` | None | Partial close to reduce dollar risk? Full exit if thesis broken |
+| **LOSS_MODERATE** | `JOB2_LOSS_MODERATE_R ≤ r < JOB2_LOSS_MILD_R` | None | Is pullback noise or directional? Two deterioration signs → Exit |
+| **LOSS_MILD** | `JOB2_LOSS_MILD_R ≤ r < 0` | None | Normal noise? Thesis still intact? |
+| **EARLY** | `0 ≤ r < JOB2_BREAKEVEN_R` | None | Is thesis still valid? Any early exit signals? |
+| **BREAKEVEN** | `r ≥ JOB2_BREAKEVEN_R` | Move SL to `entry + 3p buffer` (if safeguards pass) | Is the move stalling or continuing? |
+| **PROFIT** | `r ≥ JOB2_PARTIAL_TP_R` | None | Trim 33/50/75% or hold for bigger target? |
+| **TRAIL** | `r ≥ JOB2_TRAIL_R` | Trail SL at `1.5 × ATR-M15` behind price (never backwards) | Is momentum still strong enough to trail, or take full profit? |
 | **OVERDUE** | `hours_open > 1.5 × expected_horizon` | None | Compelling reason to hold past horizon, or exit/tighten now? |
 | **UNKNOWN** | No original SL data | None | Assess on current P&L and market conditions only |
 
-R-multiple is computed as: `pips_in_profit / original_sl_pips`. `original_sl_pips` is recovered from the trade journal via the `ticket_map.json` reverse lookup. If not available, the current SL distance from entry is used as a fallback.
+R-multiple is computed as: `pips_in_profit / original_sl_pips`. `original_sl_pips` is recovered from the trade journal via the `ticket_map.json` reverse lookup. If not available, the current SL distance from entry is used as a fallback. The in-memory `_sl_cache` freezes this value at first sight so it remains stable even after breakeven SL or trail moves that would corrupt a current-SL fallback.
 
 ### Auto-execute (no approval required)
 
@@ -1004,25 +1048,45 @@ R-multiple is computed as: `pips_in_profit / original_sl_pips`. `original_sl_pip
 
 `normal_spread_pips` is stored per pair in `config.PAIRS` (EURUSD: 1.0p, GBPUSD: 1.5p, USDJPY: 1.0p, AUDUSD: 1.5p).
 
-### Enriched position context passed to LLM
+### Two-tier prompt design
 
-Beyond the basic position data, each LLM call now receives:
+#### Routine prompt (`_build_routine_prompt`)
 
-- **R-multiple and phase** — `current_r = 1.32R | phase: BREAKEVEN`
-- **Net P&L** — `profit + swap` so carry costs are visible (e.g. `+$14.20 gross | swap -$3.50 | net +$10.70`)
-- **Breakeven status** — whether SL is already at or above entry
-- **Time in trade vs expected horizon** — `opened 6.2h ago | expected horizon: 8h | OVERDUE flag`
-- **Live technical indicators** (from `pipeline/price_agent.get_indicators()`):
-  - ATR-M15 — intraday noise level, used for trail distance
-  - RSI-M15 and D1 — momentum exhaustion check
-  - MACD histogram — momentum direction and strength
-  - M15 momentum bias — bullish / bearish / neutral (last 8 bars vote)
-- **Original signal context** (from `trade_journal.py` via `ticket_map.json`):
-  - Original rationale, time horizon, invalidation condition, risk note
-- **Portfolio exposure context** (from `mt5/portfolio_risk.py`):
-  - Other open positions, their USD-direction bucket, and aggregate risk %
+Sent to Azure GPT-5.2 / Haiku. Estimated ~600 tokens. Sections:
 
-### Phase-specific prompt design
+1. **Position** — direction, volume, entry, current price, pips, R-multiple, net P&L, SL/TP, time in trade
+2. **Technical Indicators** — ATR-M15, RSI-M15, MACD histogram, M15 momentum bias
+3. **Session Prices** — symbol + DXY + US10Y with today's % change (compact single line)
+4. **Recent News** — last 6 scored headlines for this pair today (`[time] [score] headline`)
+5. **Original Trade Thesis** — rationale, invalidation condition, time horizon from trade journal
+6. **Phase** — current phase + R + phase-specific question
+7. **Assessment Approach** — three explicit questions the model must evaluate:
+   - Indicator alignment: do RSI, MACD, M15 bias support or oppose the trade?
+   - News impact: does any headline materially reverse the original catalyst?
+   - Phase fit: is the R-multiple consistent with holding to target?
+
+JSON output includes `reasoning_summary` (3 sentences covering all three assessments) alongside `action`, `confidence`, `rationale`, `suggested_trim_pct`. The `reasoning_summary` provides an audit trail of why the model reached its decision.
+
+#### Priority prompt (`_build_prompt`)
+
+Sent to Claude Sonnet. Sections:
+
+1. **Position** — full enriched detail (same as routine)
+2. **Account** — equity, balance, free margin, margin level, drawdown
+3. **Market Snapshot** — live bid/ask/spread, current EST time
+4. **Technical Indicators** — same as routine
+5. **Original Trade Thesis** — full rationale, invalidation, risk note (up to 300 chars)
+6. **Portfolio Context** — other open positions with USD-direction bucket and risk %
+7. **Recent Market Context** (`_build_job2_news_context`):
+   - Last 8 scored headlines for this pair today
+   - Released economic events today with actual/forecast/surprise (ForexFactory)
+   - Session prices for 5 assets: symbol + DXY + US10Y + Gold + VIX
+   This replaces the former `build_context()[:2000]` truncation, which was designed
+   for signal generation (7-day summaries, full price tables) — not position management.
+8. **Phase Assessment** — phase-specific question block (see below)
+9. **Theory Invalidation Check** (non-loss phases only — see dedicated section)
+
+#### Phase-specific prompt design
 
 Rather than a single generic prompt, Job 2 sends a phase-specific question block:
 
@@ -1038,7 +1102,50 @@ Allowed actions: "Hold", "Exit", or "Trim" (with suggested_trim_pct 25-75).
 "SetTP" also allowed if you see a better target.
 ```
 
-The LLM returns:
+### Enriched position data (both tiers)
+
+- **R-multiple and phase** — `current_r = 1.32R | phase: BREAKEVEN`
+- **Net P&L** — `profit + swap` so carry costs are visible
+- **Breakeven status** — whether SL is already at or above entry
+- **Time in trade vs expected horizon** — `opened 6.2h ago | expected horizon: 8h | OVERDUE flag`
+- **Live technical indicators** (from `pipeline/price_agent.get_indicators()`):
+  - ATR-M15 — intraday noise level, used for trail distance
+  - RSI-M15 and D1 — momentum exhaustion check
+  - MACD histogram — momentum direction and strength
+  - M15 momentum bias — bullish / bearish / neutral (last 8 bars vote)
+- **Original signal context** (from `trade_journal.py` via `ticket_map.json`):
+  - Original rationale, time horizon, invalidation condition, risk note
+- **Portfolio exposure context** (from `mt5/portfolio_risk.py`):
+  - Other open positions, their USD-direction bucket, and aggregate risk %
+
+### Theory invalidation check
+
+Fires at every non-loss phase (EARLY, BREAKEVEN, PROFIT, TRAIL, OVERDUE). Suppressed in loss phases because the loss-phase question blocks already explicitly ask about thesis validity — running both would double-prompt the model toward Exit on what might be normal noise.
+
+```
+=== THEORY INVALIDATION CHECK ===
+Original invalidation condition: Close below 1.2680 (SMA20)
+Original thesis summary: UK CPI surprise (3.2% vs 2.9%) reduces BOE cut probability...
+Current position: BREAKEVEN at 1.03R
+
+Thesis is INVALIDATED if ANY of these apply:
+  1. Price has convincingly closed beyond the stated invalidation level
+  2. A news/macro event has directly and definitively reversed the original catalyst
+  3. The structural setup has been negated (cited support/resistance fully broken)
+
+Thesis is NOT invalidated by:
+  - Normal pullbacks within ATR range
+  - Temporary adverse moves that haven't breached key levels
+
+Set theory_invalidated=true only when you are confident the thesis is definitively broken.
+If true, your action MUST be Exit — this overrides phase-based logic.
+```
+
+When `theory_invalidated=true` is returned and `action != "Exit"`, the code forces `action = "Exit"`, prepends `[THESIS INVALIDATED — overriding {original_action}]` to the rationale, and sets `_theory_override=True` on the record. The Slack notification uses a 💡🚨 emoji rather than the standard 🚨 to distinguish thesis-driven exits from drawdown exits.
+
+For positions opened manually (no journal entry): the model defaults to `theory_invalidated=false` and can only override this if price action alone is catastrophically adverse (price blown through where a stop should be, or a major macro reversal underway in that direction).
+
+The priority Sonnet LLM JSON output includes `theory_invalidated` and `theory_invalidation_reason` fields in all phases. The `reasoning_summary` in the routine prompt serves an analogous purpose for auditability.
 
 ```json
 {
@@ -1048,20 +1155,29 @@ The LLM returns:
   "risk_note": "Any immediate risks",
   "suggested_sl": null,
   "suggested_tp": null,
-  "suggested_trim_pct": 50
+  "suggested_trim_pct": 50,
+  "theory_invalidated": false,
+  "theory_invalidation_reason": ""
 }
 ```
 
-### Signal routing
+### Signal routing and notification
 
-| LLM action | Routing | Approval |
-|------------|---------|----------|
-| Hold | Slack notification only | None |
-| Exit | Saved to `pending_signals.json` | Required |
-| Trim | Saved to `pending_signals.json` | Required |
-| SetSL / SetTP / SetSLTP | Saved to `pending_signals.json` | Required |
-| Breakeven SL (auto) | `modify_sl_tp()` called directly | None — notify only |
-| Trail SL (auto) | `modify_sl_tp()` called directly | None — notify only |
+| LLM action | Tier | Routing | Notification | Approval |
+|------------|------|---------|--------------|----------|
+| Hold | Routine | None | 🕐 compact one-liner (low noise) | None |
+| Hold | Priority | None | ⚡ full Slack alert | None |
+| Theory-invalidated Exit | Priority | Saved to pending | 💡🚨 full alert with `[THESIS INVALIDATED]` prefix | Required |
+| Exit | Either | Saved to pending | 🚨 full Slack alert | Required |
+| Trim | Either | Saved to pending | ✂️ full Slack alert | Required |
+| SetSL / SetTP / SetSLTP | Priority | Saved to pending | 🔒/🎯 full Slack alert | Required |
+| Breakeven SL (auto) | Phase engine | `modify_sl_tp()` direct | 🔒 Auto Breakeven | None |
+| Trail SL (auto) | Phase engine | `modify_sl_tp()` direct | 🔒 Auto Trail SL | None |
+
+Routine Hold notifications (`_notify_routine_hold`) are compact single-line messages:
+```
+🕐 Routine #12345678 BUY EURUSD | +$23.40 | 0.87R | EARLY | Hold [Medium] — RSI-M15 neutral at 52, no adverse headlines today, R within expected range for EARLY phase
+```
 
 ---
 
@@ -1179,13 +1295,15 @@ min_dist    = (stops_level + 3 * 10) * info.point   # +3 pip safety buffer
 
 A 3-pip buffer (`_MIN_STOP_BUFFER_PIPS = 3`) is added on top of the broker minimum to handle the broker's floating stop level during volatile conditions. Adjustments are logged as warnings showing the original and adjusted price.
 
-### R:R warning
+### R:R thresholds — two levels with distinct roles
 
-`compute_order_preview()` includes a `rr_warning: bool` field set to `True` when the computed risk-reward ratio is below 1.5. This is surfaced as a ⚠️ inline on the Slack order line so the trader can evaluate the setup before approving.
+Two config values govern R:R checks, each with a separate purpose:
 
-### Minimum R:R gate
+**`JOB3_RR_WARNING` (default 1.5) — soft warning.**  
+`compute_order_preview()` sets `rr_warning = True` when R:R < `JOB3_RR_WARNING`. This surfaces as a ⚠️ inline on the Slack order line. The analysis prompt (step 7) also instructs the model to flag R:R below this threshold in `risk_note`. The trade can still be approved and executed.
 
-A hard execution gate enforces `JOB3_MIN_RR` (default: 1.0) before any Long/Short order is placed. R:R is computed live from the signal's SL and TP prices at execution time:
+**`JOB3_MIN_RR` (default 0.5) — hard execution block.**  
+A backstop gate in `execute_signal()` rejects any Long/Short where R:R falls below this value — even if the signal was manually approved from Slack. R:R is computed live from the signal's SL and TP prices at execution time:
 
 ```python
 tp_pips = abs(tp_price - current_price) / pip
@@ -1194,9 +1312,7 @@ if rr < config.JOB3_MIN_RR:
     return {"ok": False, "error": f"R:R {rr:.2f} below minimum {config.JOB3_MIN_RR} — signal rejected"}
 ```
 
-This is a backstop — it fires even if a user manually approves a signal from Slack. The upstream analysis prompt also enforces the same threshold as a generation-time constraint: rule 7 in `_PROMPT_TEMPLATE` instructs the LLM to scan the nearest 2-3 significant technical levels (swing highs/lows, SMAs, Bollinger midline, round numbers, prev day H/L) and use the closest one that satisfies R:R ≥ `JOB3_MIN_RR`. If no structural level within 2× ATR-14 satisfies the threshold, the model outputs `Wait` with `wait_reason=rr_insufficient`. Both the prompt rule and the execution gate read from `config.JOB3_MIN_RR` so changing the value applies everywhere.
-
-**Why 1.0 as the floor:** A ratio below 1.0 means TP is closer than SL — every winning trade is smaller than every losing trade. The strategy requires a win rate above 50% just to break even, with no margin for slippage or spread. 1.0 is the minimum viable edge. Raise to 1.2–1.5 once `outcome_log.json` has sufficient calibration data to verify win rate.
+**Design intent:** The analysis prompt (step 7) always tries to produce a tradeable Long or Short — R:R no longer causes `Wait`. Low R:R is treated as a risk warning, not a disqualifier. The execution gate (`JOB3_MIN_RR = 0.5`) catches only genuinely negative-edge setups where TP is less than half the SL distance. Raise `JOB3_MIN_RR` to 1.0–1.5 once `outcome_log.json` has sufficient calibration data to support a tighter floor.
 
 ### Signal expiry
 
@@ -1364,7 +1480,8 @@ class _SafeRotatingFileHandler(RotatingFileHandler):
 | Signal debate judge (CIO) | `analysis/ensemble_agent.py` | Claude Sonnet 4.6 | Synthesis, scoring, and SL/TP adjustment; quality matters more than speed here |
 | Position debate personas (Hold/Exit/Devil's Advocate) | `analysis/ensemble_agent.py` | Azure GPT-5.2 → Claude Haiku 4.5 fallback | Same `_gather_personas_async` path as signal debate; Devil focuses on cognitive bias (sunk-cost, fear) |
 | Position debate judge | `analysis/ensemble_agent.py` | Claude Sonnet 4.6 | Same judge path as signal debate |
-| Position monitor — Hold/Trim/Exit (Job 2) | `agents/job2_position.py` | Claude Sonnet 4.6 (`ANALYSIS_MODEL`) | Risk management; accuracy over speed |
+| Position monitor — routine 30-min check | `agents/job2_position.py` | Azure GPT-5.2 → Claude Haiku 4.5 fallback | Cost-efficient routine scan; 600-token prompt with news + indicators + reasoning_summary |
+| Position monitor — priority / phase transition | `agents/job2_position.py` | Claude Sonnet 4.6 (`ANALYSIS_MODEL`) | Full enriched prompt; theory invalidation; risk management accuracy matters |
 | Daily summary generation | `pipeline/daily_collector.py` | Claude Sonnet 4.6 (`ANALYSIS_MODEL`) | User-facing; quality matters |
 | CB policy extraction | `pipeline/cb_policy_updater.py` | Claude Haiku 4.5 (`TRIAGE_MODEL`) | Structured JSON extraction; Haiku is sufficient |
 | Chat assistant (Job 4) | `agents/job4_chat.py` | Claude Sonnet 4.6 (`ANALYSIS_MODEL`) | Conversational + tool calling; quality matters |
@@ -1409,7 +1526,8 @@ All parameters in `config.py`. Key values:
 | `JOB3_MAX_OPEN_TRADES` | `3` | Hard cap on concurrent positions across all pairs |
 | `JOB3_MAX_PORTFOLIO_RISK_PCT` | `3.0` | Max total portfolio risk % before blocking new entry |
 | `JOB3_MAX_CORRELATED_RISK_PCT` | `2.0` | Max risk within one USD-direction bucket |
-| `JOB3_MIN_RR` | `1.0` | Minimum TP/SL ratio — blocks execution below this; also injected into analysis prompt |
+| `JOB3_MIN_RR` | `0.5` | Hard execution block — signals with R:R below this are rejected at execution time |
+| `JOB3_RR_WARNING` | `1.5` | Soft warning threshold — ⚠️ shown in Slack preview; model instructed to flag in `risk_note` |
 | `JOB3_SIGNAL_EXPIRY_MINUTES` | `60` | Signal validity window |
 | `CONTEXT_MAX_TOKENS` | (config) | Context window budget for analysis LLM |
 | `CONTEXT_DAYS_SUMMARY` | `7` | Days of daily summaries to include |
