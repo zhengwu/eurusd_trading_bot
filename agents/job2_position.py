@@ -558,6 +558,69 @@ def _build_invalidation_block(original: dict | None, phase_info: dict) -> str:
     )
 
 
+# ── routine prompt (cheap model) ─────────────────────────────────────────────
+
+def _build_routine_prompt(
+    pos: dict,
+    phase_info: dict,
+    indicators: dict,
+    original: dict | None,
+) -> str:
+    """
+    Stripped prompt for routine 30-min checks.
+    No market context, no portfolio, no account, no theory invalidation.
+    Estimated ~400 tokens vs ~1500 for the full prompt.
+    """
+    symbol  = pos.get("symbol", config.MT5_SYMBOL)
+    display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
+    phase   = phase_info["phase"]
+    cr      = phase_info.get("current_r")
+    r_str   = f"{cr:.2f}R" if cr is not None else "unknown R"
+
+    if phase in (PHASE_LOSS_CRITICAL, PHASE_LOSS_DEEP):
+        phase_note   = f"Significant loss at {r_str}. Is the original thesis still valid or should we exit?"
+        allowed      = '"Hold" or "Exit" only.'
+    elif phase in (PHASE_LOSS_MODERATE, PHASE_LOSS_MILD):
+        phase_note   = f"In loss at {r_str}. Review thesis and momentum indicators."
+        allowed      = '"Hold" or "Exit" only.'
+    elif phase in (PHASE_TRAIL, PHASE_PROFIT):
+        can_trim_pos = _can_trim(pos)
+        phase_note   = f"In profit at {r_str}. Assess momentum and partial-profit opportunity."
+        allowed      = '"Hold", "Exit"' + (', or "Trim".' if can_trim_pos else '.')
+    else:
+        phase_note   = f"Phase: {phase.upper()} at {r_str}."
+        allowed      = '"Hold" or "Exit".'
+
+    return f"""\
+Routine {display} position check — quick indicators-based assessment.
+
+=== POSITION ===
+{_fmt_position(pos, phase_info)}
+
+=== TECHNICAL INDICATORS ===
+{_fmt_indicators(indicators)}
+
+=== ORIGINAL TRADE THESIS ===
+{_fmt_original_signal(original)}
+
+=== PHASE ===
+{phase.upper()} at {r_str} — {phase_note}
+
+Provide a concise JSON assessment:
+{{
+  "action": "Hold | Exit | Trim",
+  "confidence": "High | Medium | Low",
+  "rationale": "1-2 sentences on position status and key indicator signals",
+  "suggested_trim_pct": null
+}}
+
+Rules:
+- Allowed actions: {allowed}
+- No SL/TP modifications in routine checks — those require full analysis
+- If action=Exit AND confidence=High: this triggers a full Sonnet re-analysis automatically
+- Return ONLY valid JSON, no other text."""
+
+
 # ── phase-specific prompts ────────────────────────────────────────────────────
 
 def _build_prompt(
@@ -783,7 +846,65 @@ Rules:
     return prompt
 
 
-# ── LLM call ──────────────────────────────────────────────────────────────────
+# ── LLM calls ─────────────────────────────────────────────────────────────────
+
+def _call_routine_llm(prompt: str, symbol: str) -> dict | None:
+    """
+    Cheap model call for routine 30-min checks.
+    Tries Azure GPT-5.2 first (free for user); falls back to Claude Haiku.
+    """
+    display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
+    system  = f"You are a {display} forex position manager. Be concise and precise."
+
+    raw: str | None = None
+
+    # ── Azure GPT (primary) ───────────────────────────────────────────────────
+    try:
+        from triage.triage_prompt import _get_azure_client
+        azure_client = _get_azure_client()
+        if azure_client is None:
+            raise RuntimeError("Azure client not configured")
+        import os as _os
+        deployment = _os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
+        resp = azure_client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": prompt},
+            ],
+            max_tokens=200,
+        )
+        raw = resp.choices[0].message.content.strip()
+        logger.debug(f"Routine check [{symbol}]: Azure {deployment}")
+    except Exception as az_err:
+        logger.debug(f"Azure routine unavailable ({az_err}) — Haiku fallback")
+
+    # ── Claude Haiku fallback ─────────────────────────────────────────────────
+    if raw is None:
+        try:
+            msg = _get_client().messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=200,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = msg.content[0].text.strip()
+            logger.debug(f"Routine check [{symbol}]: Haiku fallback")
+        except Exception as haiku_err:
+            logger.error(f"Routine LLM both failed [{symbol}]: {haiku_err}")
+            return None
+
+    clean = re.sub(r"^```[a-z]*\n?", "", raw)
+    clean = re.sub(r"\n?```$", "", clean).strip()
+    try:
+        result = json.loads(clean)
+        if not isinstance(result, dict):
+            raise ValueError("Expected JSON object")
+        return result
+    except Exception as e:
+        logger.error(f"Routine LLM parse failed [{symbol}]: {e}\nRaw: {raw[:300]}")
+        return None
+
 
 def _call_llm(prompt: str, symbol: str) -> dict | None:
     display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
@@ -835,6 +956,8 @@ def _build_signal(pos: dict, rec: dict) -> dict[str, Any]:
         "_symbol":       symbol,
         "_ticket":       pos.get("ticket"),
         "_source":       "job2",
+        "_analysis_tier":           rec.get("_analysis_tier", "routine"),
+        "_escalated_from_routine":  rec.get("_escalated_from_routine", False),
         "sl":            rec.get("suggested_sl"),
         "tp":            rec.get("suggested_tp"),
         "suggested_trim_pct": rec.get("suggested_trim_pct"),
@@ -1004,11 +1127,99 @@ def analyze_position(pos: dict, portfolio: dict) -> dict[str, Any] | None:
             + rec.get("rationale", "")
         )
 
-    rec["ticket"]     = ticket
-    rec["source"]     = "job2"
-    rec["phase"]      = phase_info["phase"]
-    rec["phase_info"] = phase_info
+    rec["ticket"]         = ticket
+    rec["source"]         = "job2"
+    rec["phase"]          = phase_info["phase"]
+    rec["phase_info"]     = phase_info
+    rec["_analysis_tier"] = "priority"
     return rec
+
+
+def analyze_position_routine(pos: dict, portfolio: dict) -> dict | None:
+    """
+    Routine 30-min position check using cheap model (Azure GPT / Haiku fallback).
+    Escalates to full Sonnet analysis if cheap model returns Exit [High confidence].
+    Returns rec with _analysis_tier="routine" or "priority".
+    """
+    symbol = pos.get("symbol", config.MT5_SYMBOL)
+    ticket = pos.get("ticket")
+
+    original   = _get_original_signal(ticket)
+    phase_info = _compute_phase(pos, original)
+
+    # Seed sl_cache on first sight (mirrors watcher logic)
+    if ticket and ticket not in _sl_cache:
+        sl         = pos.get("sl") or 0.0
+        open_price = pos.get("open_price", 0.0)
+        direction  = pos.get("type", "buy")
+        pip        = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
+        if sl:
+            raw_pips = (open_price - sl) / pip if direction == "buy" else (sl - open_price) / pip
+            sl_pips  = max(0.0, raw_pips)
+            if sl_pips > 0:
+                _sl_cache[ticket] = sl_pips
+
+    logger.info(
+        f"#{ticket} routine check — phase={phase_info['phase']} "
+        f"R={phase_info['current_r']} pips={phase_info['pips_profit']:+.1f}"
+    )
+
+    indicators: dict = {}
+    try:
+        from pipeline.price_agent import get_indicators
+        indicators = get_indicators(symbol)
+    except Exception as e:
+        logger.warning(f"get_indicators failed for {symbol}: {e}")
+
+    prompt = _build_routine_prompt(pos, phase_info, indicators, original)
+    rec    = _call_routine_llm(prompt, symbol)
+    if rec is None:
+        return None
+
+    # Escalate to full Sonnet if cheap model signals Exit with High confidence
+    if rec.get("action") == "Exit" and rec.get("confidence") == "High":
+        logger.info(
+            f"#{ticket} Routine Exit [High] — escalating to full Sonnet analysis"
+        )
+        full_rec = analyze_position(pos, portfolio)
+        if full_rec:
+            full_rec["_escalated_from_routine"] = True
+        return full_rec  # may be None if Sonnet call fails — caller handles gracefully
+
+    rec["ticket"]         = ticket
+    rec["source"]         = "job2"
+    rec["phase"]          = phase_info["phase"]
+    rec["phase_info"]     = phase_info
+    rec["_analysis_tier"] = "routine"
+    return rec
+
+
+# ── auto-action notification ──────────────────────────────────────────────────
+
+
+def _notify_routine_hold(pos: dict, rec: dict) -> None:
+    """
+    Compact one-line notification for routine Hold results.
+    Avoids the full Slack alert format to reduce noise.
+    """
+    from notifications.notifier import notify_text
+    symbol     = pos.get("symbol", config.MT5_SYMBOL)
+    direction  = pos.get("type", "").upper()
+    ticket     = pos.get("ticket")
+    profit     = pos.get("profit", 0.0)
+    profit_str = f"+${profit:.2f}" if profit >= 0 else f"-${abs(profit):.2f}"
+    phase      = rec.get("phase", "")
+    current_r  = (rec.get("phase_info") or {}).get("current_r")
+    r_str      = f" | {current_r:.2f}R" if current_r is not None else ""
+    rationale  = (rec.get("rationale") or "")[:120]
+    confidence = rec.get("confidence", "?")
+
+    notify_text(
+        f"\U0001f554 Routine #{ticket} {direction} {symbol}"
+        f" | {profit_str}{r_str} | {phase.upper()}"
+        f" | Hold [{confidence}] — {rationale}"
+    )
+    logger.info(f"#{ticket} [{phase}] Routine Hold notified (compact)")
 
 
 def run_position_check() -> int:
@@ -1037,23 +1248,25 @@ def run_position_check() -> int:
     for pos in positions:
         ticket = pos.get("ticket")
         try:
-            rec = analyze_position(pos, portfolio)
+            # Routine check: cheap model, escalates to Sonnet if Exit+High
+            rec = analyze_position_routine(pos, portfolio)
             if rec is None:
                 continue
 
             action     = rec.get("action", "Hold")
             confidence = rec.get("confidence", "Low")
             phase      = rec.get("phase", PHASE_UNKNOWN)
-            logger.info(f"Position #{ticket} [{phase}]: {action} [{confidence}]")
+            tier       = rec.get("_analysis_tier", "routine")
+            logger.info(f"Position #{ticket} [{phase}][{tier}]: {action} [{confidence}]")
 
             signal  = _build_signal(pos, rec)
             trigger = _build_trigger(pos, rec, rec.get("phase_info", {}))
 
-            # Route: save to signal store for approval, or just notify
+            # Route: save actionable signals to store for approval
             if action in ("Exit", "Trim"):
                 if action == "Trim" and not _can_trim(pos):
                     logger.warning(
-                        f"#{ticket} Trim recommended but volume too small — downgrading to Hold notify"
+                        f"#{ticket} Trim recommended but volume too small — downgrading to Hold"
                     )
                     action = "Hold"
                 else:
@@ -1063,14 +1276,18 @@ def run_position_check() -> int:
                     logger.info(f"Pending signal saved: {signal_id} — awaiting approval")
 
             elif action in ("SetSL", "SetTP", "SetSLTP"):
-                # SL/TP modifications from LLM also go through approval
-                # (auto-breakeven and auto-trail already executed above without approval)
                 from pipeline.signal_store import save_pending_signal
                 signal_id = save_pending_signal(signal, source="job2")
                 signal["_signal_id"] = signal_id
                 logger.info(f"SetSL/TP signal saved: {signal_id} — awaiting approval")
 
-            notify(signal, trigger_item=trigger)
+            # Notification routing:
+            #   Routine Hold → compact one-liner (low noise)
+            #   Everything else (priority, Exit, Trim, SetSL/TP) → full alert
+            if tier == "routine" and action == "Hold":
+                _notify_routine_hold(pos, rec)
+            else:
+                notify(signal, trigger_item=trigger)
 
         except Exception as e:
             logger.error(f"Position check failed for #{ticket}: {e}", exc_info=True)

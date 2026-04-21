@@ -380,8 +380,15 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
     signal_id = signal.get("_signal_id")
     source = signal.get("_source", "job1")
 
-    # Source label for Job 2 position alerts
-    source_label = " _(Position Monitor)_" if source == "job2" else ""
+    # Source label for Job 2 position alerts — distinguish routine vs priority
+    if source == "job2":
+        if signal.get("_analysis_tier") == "priority":
+            escalated_tag = " — escalated" if signal.get("_escalated_from_routine") else ""
+            source_label  = f" ⚡ _(Priority Analysis{escalated_tag})_"
+        else:
+            source_label  = " 🕐 _(Routine Monitor)_"
+    else:
+        source_label = ""
 
     snap = signal.get("price_snapshot") or {}
     current       = snap.get("current")
