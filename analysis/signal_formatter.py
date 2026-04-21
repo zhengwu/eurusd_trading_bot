@@ -40,11 +40,19 @@ def format_signal(raw: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(price_snapshot, dict):
         price_snapshot = {}
 
+    # related_ticket may be int or str from LLM; normalise to int or None
+    related_ticket_raw = raw.get("related_ticket")
+    try:
+        related_ticket = int(related_ticket_raw) if related_ticket_raw not in (None, "", "null") else None
+    except (TypeError, ValueError):
+        related_ticket = None
+
     return {
         "signal": signal,
         "confidence": confidence,
         "time_horizon": horizon,
-        "rationale": str(raw.get("rationale", "")),
+        # LLM outputs technical_rationale; fall back to rationale for backwards compat
+        "rationale": str(raw.get("technical_rationale") or raw.get("rationale", "")),
         "key_levels": {
             "support": key_levels.get("support"),
             "resistance": key_levels.get("resistance"),
@@ -62,5 +70,7 @@ def format_signal(raw: dict[str, Any]) -> dict[str, Any]:
         "today_summary": str(raw.get("today_summary", "")),
         "week_summary":  str(raw.get("week_summary", "")),
         "wait_reason":   str(raw.get("wait_reason", "")),
+        "theory_classification": str(raw.get("theory_classification", "")),
+        "related_ticket": related_ticket,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

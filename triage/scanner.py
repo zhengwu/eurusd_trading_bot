@@ -263,8 +263,31 @@ def _run_pair_scan(symbol: str) -> list[dict]:
         from notifications.notifier import notify
 
         context = build_context(symbol=symbol, trigger_item=trigger)
-        raw_signal = run_full_analysis(context, symbol=symbol)
+
+        # Inject open position theories so LLM can classify new vs continuation
+        open_pos_context = ""
+        try:
+            from analysis.context_builder import get_open_position_theories
+            from mt5.connector import is_connected
+            if is_connected():
+                open_pos_context = get_open_position_theories(symbol)
+        except Exception as e:
+            logger.warning(f"[{symbol}] Open position context failed (non-fatal): {e}")
+
+        raw_signal = run_full_analysis(
+            context, symbol=symbol,
+            open_positions_context=open_pos_context or None,
+        )
         signal = format_signal(raw_signal)
+
+        # Propagate theory classification from raw LLM output
+        if raw_signal.get("theory_classification") == "continuation":
+            signal["_is_continuation"] = True
+            signal["_related_ticket"]  = signal.get("related_ticket")
+            logger.info(
+                f"[{symbol}] Signal classified as continuation "
+                f"(related_ticket={signal.get('_related_ticket')})"
+            )
         signal["_symbol"] = symbol
 
         # Mark triggered items in the log
@@ -364,26 +387,32 @@ def _run_pair_scan(symbol: str) -> list[dict]:
             + (f" | wait_reason={wait_reason}" if wait_reason else "")
         )
 
-        # Auto-approve high-conviction Long/Short signals
+        # Auto-approve high-conviction Long/Short signals (never for continuations)
         _auto_threshold = config.JOB3_AUTO_APPROVE_MAX_UNCERTAINTY
         if (
             _auto_threshold is not None
             and signal.get("signal") in ("Long", "Short")
             and signal.get("_signal_id")
         ):
-            unc = signal.get("uncertainty_score")
-            if unc is not None and unc <= _auto_threshold:
+            if signal.get("_is_continuation"):
                 logger.info(
-                    f"[{symbol}] Uncertainty {unc} <= {_auto_threshold} — "
-                    f"auto-approving signal {signal['_signal_id']}"
+                    f"[{symbol}] Auto-approve suppressed — continuation signal "
+                    f"(ticket {signal.get('_related_ticket')}) requires manual review"
                 )
-                t = threading.Thread(
-                    target=_auto_approve_signal,
-                    args=(signal["_signal_id"], symbol, unc),
-                    daemon=True,
-                    name=f"auto-approve-{signal['_signal_id']}",
-                )
-                t.start()
+            else:
+                unc = signal.get("uncertainty_score")
+                if unc is not None and unc <= _auto_threshold:
+                    logger.info(
+                        f"[{symbol}] Uncertainty {unc} <= {_auto_threshold} — "
+                        f"auto-approving signal {signal['_signal_id']}"
+                    )
+                    t = threading.Thread(
+                        target=_auto_approve_signal,
+                        args=(signal["_signal_id"], symbol, unc),
+                        daemon=True,
+                        name=f"auto-approve-{signal['_signal_id']}",
+                    )
+                    t.start()
     except Exception as e:
         logger.error(f"[{symbol}] Full analysis pipeline failed: {e}", exc_info=True)
 

@@ -56,6 +56,11 @@ def _format_alert(signal: dict[str, Any], trigger_item: dict[str, Any] | None = 
     today_sum   = signal.get("today_summary", "")
     week_sum    = signal.get("week_summary", "")
 
+    cont_line = ""
+    if signal.get("_is_continuation"):
+        ticket = signal.get("_related_ticket")
+        cont_line = f"\n  Theory     : Continuation of open position (ticket #{ticket})\n" if ticket else "\n  Theory     : Continuation of existing position\n"
+
     return (
         f"{'═' * 55}\n"
         f"  {display} SIGNAL ALERT — {now}\n"
@@ -63,6 +68,7 @@ def _format_alert(signal: dict[str, Any], trigger_item: dict[str, Any] | None = 
         f"  Signal     : {signal.get('signal', 'N/A')}\n"
         f"  Confidence : {signal.get('confidence', 'N/A')}\n"
         f"  Horizon    : {signal.get('time_horizon', 'N/A')}\n"
+        f"{cont_line}"
         f"{trigger_line}"
         f"\n  Price Snapshot:\n"
         f"    Current    : {current}\n"
@@ -76,6 +82,7 @@ def _format_alert(signal: dict[str, Any], trigger_item: dict[str, Any] | None = 
         f"    Resistance : {resistance}\n"
         f"\n  Invalidation:\n  {signal.get('invalidation', '')}\n"
         f"\n  Risk Note:\n  {signal.get('risk_note', '')}\n"
+        + (f"\n  Wait Reason:\n  {signal.get('wait_reason', '')}\n" if signal.get('signal') == 'Wait' and signal.get('wait_reason') else "")
         + _fmt_order_preview(signal.get("_order_preview"))
         + _fmt_debate(signal.get("_debate"), signal.get("_uncertainty_score"), signal.get("_debate_veto"), signal.get("signal", ""))
         + f"{'═' * 55}"
@@ -86,7 +93,7 @@ def _fmt_order_preview(preview: dict | None) -> str:
     if not preview:
         return ""
     src = " (live)" if preview.get("live_price") else " (estimated)"
-    rr_warn = "  [!] R:R below 1.5 — consider skipping" if preview.get("rr_warning") else ""
+    rr_warn = f"  [!] R:R below {config.JOB3_RR_WARNING} — consider skipping" if preview.get("rr_warning") else ""
     return (
         f"\n  Order Details{src}:\n"
         f"    Entry      : {preview.get('entry_price', '—')}\n"
@@ -292,7 +299,7 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
         risk    = order_preview.get("risk_amount", "—")
         rr      = order_preview.get("risk_reward", "—")
         live    = " _(live)_" if order_preview.get("live_price") else " _(estimated)_"
-        rr_warn = "  :warning: _R:R below 1.5_" if order_preview.get("rr_warning") else ""
+        rr_warn = f"  :warning: _R:R below {config.JOB3_RR_WARNING}_" if order_preview.get("rr_warning") else ""
         size_reason = signal.get("_size_reason", "")
         size_line   = f"\n>_Sizing: {size_reason}_" if size_reason else ""
         order_line = (
@@ -403,17 +410,27 @@ def _notify_slack(signal: dict[str, Any], trigger_item: dict[str, Any] | None) -
     if week_sum:
         summary_lines += f"\n>*This week:* {week_sum}"
 
+    cont_badge = ""
+    if signal.get("_is_continuation"):
+        ticket = signal.get("_related_ticket")
+        cont_badge = (
+            f"\n>:link: *Continuation* of open position (ticket `{ticket}`)"
+            if ticket else "\n>:link: *Continuation* of existing position"
+        ) + "  _— manual approval required_"
+
     text = (
         f"{emoji} *{display} {signal_label}* {confidence_emoji} `{confidence}` — "
         f"_{signal.get('time_horizon', 'N/A')}_{source_label}\n"
         f"_{now}_{trigger_line}"
+        f"{cont_badge}"
         f"{price_line}"
         f"{summary_lines}\n\n"
         f">*Rationale:* {signal.get('rationale', '')}\n\n"
         f">*Key Levels:* Support `{support}` | Resistance `{resistance}`\n"
         f">*Invalidation:* {signal.get('invalidation', '')}\n"
         f">*Risk Note:* {signal.get('risk_note', '')}"
-        f"{order_line}"
+        + (f"\n>:pause_button: *Wait Reason:* {signal.get('wait_reason', '')}" if signal.get('signal') == 'Wait' and signal.get('wait_reason') else "")
+        + f"{order_line}"
         f"{debate_line}"
         + (f"\n\n:pencil: _To modify SL/TP/lot before executing: type `chat` and ask me_"
            if signal_id and signal_label not in ("Wait", "Hold") else "")

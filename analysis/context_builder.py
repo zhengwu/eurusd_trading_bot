@@ -300,6 +300,104 @@ def build_context(trigger_item: dict | None = None, symbol: str | None = None) -
     return full
 
 
+def _load_journal_for_symbol(symbol: str) -> list[dict]:
+    """Return all trade journal records for a given symbol."""
+    journal_path = config.DATA_DIR / "trade_journal.jsonl"
+    if not journal_path.exists():
+        return []
+    records: list[dict] = []
+    try:
+        with journal_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    if r.get("symbol") == symbol:
+                        records.append(r)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return records
+
+
+def get_open_position_theories(symbol: str) -> str:
+    """
+    Build a context block describing open positions for a symbol and their
+    original trading thesis. Injected into the full analysis prompt so the LLM
+    can classify new signals as 'continuation' or 'new_theory'.
+
+    Returns empty string if no open positions or MT5 is unavailable.
+    """
+    try:
+        from mt5.connector import is_connected
+        from mt5.position_reader import get_open_positions
+        if not is_connected():
+            return ""
+
+        positions = get_open_positions(symbol=symbol)
+        if not positions:
+            return ""
+
+        # Build ticket → journal record lookup for original thesis
+        journal_recs = _load_journal_for_symbol(symbol)
+        ticket_to_theory = {
+            str(r.get("mt5_ticket", "")): r
+            for r in journal_recs
+            if r.get("mt5_ticket") and r.get("status") == "executed"
+        }
+
+        display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
+        lines = [
+            f"=== OPEN POSITIONS — {display} ===",
+            f"You currently have {len(positions)} open position(s) on {display}.",
+            "Each new signal you generate MUST include a theory_classification field (see JSON schema).",
+            "",
+        ]
+
+        for i, pos in enumerate(positions, 1):
+            direction = "LONG" if pos["type"] == "buy" else "SHORT"
+            ticket    = str(pos["ticket"])
+            entry     = pos["open_price"]
+            sl        = pos["sl"] or "N/A"
+            tp        = pos["tp"] or "N/A"
+            pnl_usd   = pos.get("profit", 0.0)
+            opened    = pos.get("open_time", "N/A")
+
+            lines.append(f"Position #{i} — {direction}  Ticket: {ticket}")
+            lines.append(f"  Entry: {entry}  SL: {sl}  TP: {tp}")
+            lines.append(f"  Opened: {opened}  Unrealised P&L: ${pnl_usd:.2f}")
+
+            rec = ticket_to_theory.get(ticket)
+            if rec:
+                rationale    = rec.get("rationale", "")
+                invalidation = rec.get("invalidation", "")
+                if rationale:
+                    lines.append(f"  Original thesis: {rationale}")
+                if invalidation:
+                    lines.append(f"  Invalidation: {invalidation}")
+            else:
+                lines.append("  Original thesis: (unavailable — may have been opened manually)")
+            lines.append("")
+
+        lines += [
+            "CLASSIFICATION RULES:",
+            '  "continuation" — new signal is in the SAME direction AND the macro/technical thesis',
+            "    is materially the same as an existing position above (not just the same direction).",
+            '  "new_theory"   — different direction, OR a distinct thesis (e.g., existing position',
+            "    based on ECB decision; new signal based on a US CPI surprise).",
+            "  When continuation, set related_ticket to the MT5 ticket number of the matched position.",
+            "",
+        ]
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.warning(f"[{symbol}] get_open_position_theories failed (non-fatal): {e}")
+        return ""
+
+
 def _fallback_price_table(data_dir: Path) -> str:
     """Raw 30-day closing price table — used if price_agent fails."""
     rows: list[str] = [

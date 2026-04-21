@@ -23,6 +23,13 @@ logger = get_logger(__name__)
 _client: anthropic.Anthropic | None = None
 
 
+def _safe_fmt(template: str, **kwargs) -> str:
+    """Sequential placeholder substitution — safe for values containing { or }."""
+    for key, val in kwargs.items():
+        template = template.replace("{" + key + "}", str(val))
+    return template.replace("{{", "{").replace("}}", "}")
+
+
 def _get_client() -> anthropic.Anthropic:
     global _client
     if _client is None:
@@ -42,6 +49,7 @@ and pre-computed technical indicators across three timeframes (D1, H4, M15).
 
 Your goal is to identify high-probability trading setups using a top-down multi-timeframe approach.
 
+{open_positions_section}\
 ANALYTICAL PROCESS — follow this order:
 1. MACRO CONTEXT: What is the dominant macro/news narrative driving the pair right now?
 2. MULTI-TIMEFRAME STRUCTURE: Read the "Multi-timeframe confluence" section in the price summary.
@@ -56,13 +64,10 @@ signal confidence. A CONFLICTED verdict should result in Wait unless the macro c
 H4 EMA acting as dynamic support/resistance?
 6. STOP LOSS RULE: Never place SL at an obvious level. Pad by at least 1×ATR-14 (D1) beyond \
 the nearest key level. Wider SL in high-volatility regimes.
-7. RISK:REWARD RULE: Only output Long or Short if TP distance >= {min_rr}× SL distance \
-(R:R >= 1:{min_rr}). Scan the nearest 2-3 significant technical levels ahead of price \
-(swing highs/lows, SMAs, Bollinger midline, round numbers, prev day H/L) and use the closest \
-one that satisfies the R:R requirement. Do NOT invent levels or project TP arbitrarily — every \
-TP must correspond to a named structure visible in the price data. If no meaningful level within \
-a reasonable range (i.e., within 2× ATR-14 of the entry) satisfies R:R >= 1:{min_rr}, \
-output Wait. A structurally sound Wait is better than a negative-edge trade.
+7. RISK/REWARD CHECK: Scan 2-3 structural TP levels and pick the one that gives the best \
+executable R:R. Always aim to produce a tradeable Long or Short. If the best available R:R is \
+below 1:{rr_warning}, still output the signal but flag it in risk_note with a warning such as \
+"⚠ R:R X.X below {rr_warning} threshold — size down or monitor closely".
 
 {context_window}
 
@@ -79,7 +84,7 @@ verdict (ALIGNED / LEANING / CONFLICTED). Explain how this shapes your bias and 
 position (extended or mid-range?), H4 EMA support/resistance, key levels. Where is the liquidity? \
 What structure are you trading? Why is this setup high-probability given the confluence?",
   "signal": "Long | Short | Wait",
-  "wait_reason": "ONLY populate if signal=Wait. Primary reason: 'rr_insufficient' (no structural TP level within 2×ATR gives R:R >= 1:{min_rr}), 'mtf_conflicted' (D1/H4/M15 alignment is CONFLICTED), 'macro_unclear' (no clear directional catalyst), or 'risk_event_pending' (high-impact event imminent). Include a 1-sentence explanation. Leave empty string for Long/Short.",
+  "wait_reason": "ONLY populate if signal=Wait. Primary reason: 'mtf_conflicted' (D1/H4/M15 alignment is CONFLICTED), 'macro_unclear' (no clear directional catalyst), or 'risk_event_pending' (high-impact event imminent). Include a 1-sentence explanation. Leave empty string for Long/Short.",
   "confidence": "High | Medium | Low",
   "time_horizon": "Intraday | 1-3 days | This week",
   "trade_setup": {{
@@ -103,24 +108,41 @@ nearest key level, and volatility regime"
     "trend": "e.g., Bearish — BEARISH ALIGNED across D1/H4/M15, MACD bearish, below EMA20 H4"
   }},
   "invalidation": "What macro or technical development would invalidate this signal",
-  "risk_note": "Any asymmetric risks or upcoming events that could disrupt the setup"
+  "risk_note": "Any asymmetric risks or upcoming events that could disrupt the setup. \
+If R:R is below 1:{rr_warning}, prepend a warning: '⚠ R:R X.X below {rr_warning} threshold — size down or monitor closely.'",
+  "theory_classification": "new_theory | continuation — REQUIRED if open positions were listed above. \
+'continuation' only if your signal matches an existing position's direction AND is driven by the same core thesis. \
+Otherwise 'new_theory'. Omit (or set null) if no open positions were listed.",
+  "related_ticket": null
 }}
 
 Return ONLY valid JSON, no other text."""
 
 
-def run_full_analysis(context_window: str, symbol: str | None = None) -> dict[str, Any]:
+def run_full_analysis(
+    context_window: str,
+    symbol: str | None = None,
+    open_positions_context: str | None = None,
+) -> dict[str, Any]:
     """
     Run full analysis using Claude Sonnet for the given currency pair.
     Returns parsed signal dict. Returns a safe default on failure.
+
+    open_positions_context — pre-formatted open-position section built by
+        context_builder.get_open_position_theories(); injected before the
+        analytical process instructions so the LLM can classify the signal.
     """
     sym = symbol or config.MT5_SYMBOL
     display = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["display"]
     system = _SYSTEM_TEMPLATE.format(display=display)
-    prompt = _PROMPT_TEMPLATE.format(
+
+    open_pos_section = (open_positions_context + "\n") if open_positions_context else ""
+    prompt = _safe_fmt(
+        _PROMPT_TEMPLATE,
         display=display,
         context_window=context_window,
-        min_rr=config.JOB3_MIN_RR,
+        rr_warning=str(config.JOB3_RR_WARNING),
+        open_positions_section=open_pos_section,
     )
 
     try:
