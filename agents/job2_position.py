@@ -55,7 +55,6 @@ from mt5.connector import connect, disconnect, is_connected
 from mt5.position_reader import get_open_positions, get_account_summary, get_current_tick
 from mt5.order_manager import modify_sl_tp
 from mt5.portfolio_risk import get_portfolio_summary
-from analysis.context_builder import build_context
 from notifications.notifier import notify
 from utils.logger import get_logger
 from utils.date_utils import is_forex_market_open, to_est
@@ -558,6 +557,136 @@ def _build_invalidation_block(original: dict | None, phase_info: dict) -> str:
     )
 
 
+# ── targeted news/price helpers for Job 2 prompts ────────────────────────────
+
+def _build_recent_news_brief(symbol: str, n: int = 6) -> str:
+    """Last N intraday headlines for this pair (today). Compact format."""
+    try:
+        from triage.intraday_logger import read_today_intraday
+        from analysis.context_builder import _filter_intraday_by_symbol
+        records = _filter_intraday_by_symbol(read_today_intraday(), symbol)
+        if not records:
+            return "  (no headlines today)"
+        recent = records[-n:]
+        lines = []
+        for r in recent:
+            score    = r.get("score") or r.get("triage_score") or "?"
+            headline = r.get("headline") or r.get("title", "")
+            time_str = r.get("time", "")
+            lines.append(f"  [{time_str}] [{score}] {headline}")
+        return "\n".join(lines)
+    except Exception:
+        return "  (unavailable)"
+
+
+def _build_session_price_brief(symbol: str) -> str:
+    """Today's session prices: symbol + DXY + US10Y. Single-line compact format."""
+    try:
+        import json as _json
+        from utils.date_utils import today_str_utc
+        prices_path = config.DATA_DIR / today_str_utc() / "prices.json"
+        prices      = _json.loads(prices_path.read_text(encoding="utf-8"))
+
+        def _fmt(asset: str) -> str:
+            d    = prices.get(asset) or {}
+            c    = d.get("close")
+            pct  = d.get("pct_change")
+            if c is None:
+                return f"{asset}: N/A"
+            pct_str = f" ({pct:+.2f}%)" if pct is not None else ""
+            return f"{asset}: {c}{pct_str}"
+
+        parts = [_fmt(symbol), _fmt("DXY"), _fmt("US10Y")]
+        return "  " + "  |  ".join(parts)
+    except Exception:
+        return "  (unavailable)"
+
+
+def _build_job2_news_context(symbol: str) -> str:
+    """
+    Targeted recent-events context for Job 2 full Sonnet calls.
+    Replaces the generic build_context()[:2000] truncation with:
+      - Last 8 scored headlines for this pair (today)
+      - Released economic events today (actual vs forecast / surprise)
+      - Session prices: symbol + DXY + US10Y
+    """
+    import json as _json
+    from utils.date_utils import today_str_utc
+
+    today = today_str_utc()
+    sections: list[str] = []
+
+    # ── recent headlines ──────────────────────────────────────────────────────
+    try:
+        from triage.intraday_logger import read_today_intraday
+        from analysis.context_builder import _filter_intraday_by_symbol
+        records = _filter_intraday_by_symbol(read_today_intraday(), symbol)
+        recent  = records[-8:] if len(records) > 8 else records
+        if recent:
+            lines = ["Recent headlines (today, this pair):"]
+            for r in recent:
+                score    = r.get("score") or r.get("triage_score") or "?"
+                headline = r.get("headline") or r.get("title", "")
+                time_str = r.get("time", "")
+                lines.append(f"  [{time_str}] [{score}] {headline}")
+            sections.append("\n".join(lines))
+        else:
+            sections.append("Recent headlines: (none today)")
+    except Exception as e:
+        sections.append(f"Recent headlines: (unavailable: {e})")
+
+    # ── released events today ─────────────────────────────────────────────────
+    try:
+        events_path = config.DATA_DIR / today / "events.json"
+        events      = _json.loads(events_path.read_text(encoding="utf-8"))
+        released    = [
+            e for e in events
+            if e.get("release_date") == today
+            and e.get("actual") is not None
+            and e.get("source") == "ForexFactory"
+        ]
+        if released:
+            lines = ["Released events today:"]
+            for e in sorted(released, key=lambda x: x.get("time", "")):
+                actual   = e.get("actual")
+                forecast = e.get("forecast")
+                surprise = e.get("surprise", "")
+                line     = f"  {e.get('time','?')} | {e.get('event','')} ({e.get('currency','')}): actual={actual}"
+                if forecast is not None:
+                    line += f"  forecast={forecast}"
+                if surprise:
+                    line += f"  [{surprise.upper()}]"
+                lines.append(line)
+            sections.append("\n".join(lines))
+        else:
+            sections.append("Released events today: (none yet)")
+    except Exception:
+        sections.append("Released events today: (unavailable)")
+
+    # ── session prices ────────────────────────────────────────────────────────
+    try:
+        prices_path = config.DATA_DIR / today / "prices.json"
+        prices      = _json.loads(prices_path.read_text(encoding="utf-8"))
+
+        def _fmt(asset: str) -> str:
+            d   = prices.get(asset) or {}
+            c   = d.get("close")
+            pct = d.get("pct_change")
+            if c is None:
+                return f"{asset}: N/A"
+            pct_str = f" ({pct:+.2f}%)" if pct is not None else ""
+            return f"{asset}: {c}{pct_str}"
+
+        sections.append(
+            "Session prices: "
+            + "  |  ".join([_fmt(symbol), _fmt("DXY"), _fmt("US10Y"), _fmt("Gold"), _fmt("VIX")])
+        )
+    except Exception:
+        sections.append("Session prices: (unavailable)")
+
+    return "\n\n".join(sections)
+
+
 # ── routine prompt (cheap model) ─────────────────────────────────────────────
 
 def _build_routine_prompt(
@@ -567,9 +696,10 @@ def _build_routine_prompt(
     original: dict | None,
 ) -> str:
     """
-    Stripped prompt for routine 30-min checks.
-    No market context, no portfolio, no account, no theory invalidation.
-    Estimated ~400 tokens vs ~1500 for the full prompt.
+    Routine 30-min prompt for cheap model (Azure GPT / Haiku fallback).
+    Includes recent news + session price so the model isn't flying blind.
+    Includes structured assessment approach to improve output quality.
+    Estimated ~600 tokens vs ~2000+ for the full Sonnet prompt.
     """
     symbol  = pos.get("symbol", config.MT5_SYMBOL)
     display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
@@ -578,21 +708,23 @@ def _build_routine_prompt(
     r_str   = f"{cr:.2f}R" if cr is not None else "unknown R"
 
     if phase in (PHASE_LOSS_CRITICAL, PHASE_LOSS_DEEP):
-        phase_note   = f"Significant loss at {r_str}. Is the original thesis still valid or should we exit?"
-        allowed      = '"Hold" or "Exit" only.'
+        phase_note = f"Significant loss at {r_str}. Is the original thesis still valid or should we exit?"
+        allowed    = '"Hold" or "Exit" only.'
     elif phase in (PHASE_LOSS_MODERATE, PHASE_LOSS_MILD):
-        phase_note   = f"In loss at {r_str}. Review thesis and momentum indicators."
-        allowed      = '"Hold" or "Exit" only.'
+        phase_note = f"In loss at {r_str}. Review thesis and momentum."
+        allowed    = '"Hold" or "Exit" only.'
     elif phase in (PHASE_TRAIL, PHASE_PROFIT):
-        can_trim_pos = _can_trim(pos)
-        phase_note   = f"In profit at {r_str}. Assess momentum and partial-profit opportunity."
-        allowed      = '"Hold", "Exit"' + (', or "Trim".' if can_trim_pos else '.')
+        phase_note = f"In profit at {r_str}. Assess momentum and partial-profit opportunity."
+        allowed    = '"Hold", "Exit"' + (', or "Trim".' if _can_trim(pos) else '.')
     else:
-        phase_note   = f"Phase: {phase.upper()} at {r_str}."
-        allowed      = '"Hold" or "Exit".'
+        phase_note = f"Phase: {phase.upper()} at {r_str}."
+        allowed    = '"Hold" or "Exit".'
+
+    news_section  = _build_recent_news_brief(symbol)
+    price_section = _build_session_price_brief(symbol)
 
     return f"""\
-Routine {display} position check — quick indicators-based assessment.
+Routine {display} position check — indicators + news based assessment.
 
 === POSITION ===
 {_fmt_position(pos, phase_info)}
@@ -600,24 +732,38 @@ Routine {display} position check — quick indicators-based assessment.
 === TECHNICAL INDICATORS ===
 {_fmt_indicators(indicators)}
 
+=== SESSION PRICES ===
+{price_section}
+
+=== RECENT NEWS (today, {display}) ===
+{news_section}
+
 === ORIGINAL TRADE THESIS ===
 {_fmt_original_signal(original)}
 
 === PHASE ===
 {phase.upper()} at {r_str} — {phase_note}
 
-Provide a concise JSON assessment:
+=== ASSESSMENT APPROACH ===
+Evaluate these three questions to form your decision:
+1. Indicator alignment: Do RSI-M15, MACD histogram, and M15 momentum support or oppose the trade direction?
+2. News impact: Does any recent headline materially reverse the original trade catalyst?
+3. Phase fit: Is the R-multiple and price action consistent with holding through to the original target?
+Capture your conclusions in "reasoning_summary" inside the JSON.
+
+Return ONLY valid JSON:
 {{
+  "reasoning_summary": "3 short sentences covering: indicator verdict, news impact, phase assessment",
   "action": "Hold | Exit | Trim",
   "confidence": "High | Medium | Low",
-  "rationale": "1-2 sentences on position status and key indicator signals",
+  "rationale": "1-2 sentences referencing specific numbers (RSI, pips, news headline)",
   "suggested_trim_pct": null
 }}
 
 Rules:
 - Allowed actions: {allowed}
 - No SL/TP modifications in routine checks — those require full analysis
-- If action=Exit AND confidence=High: this triggers a full Sonnet re-analysis automatically
+- If action=Exit AND confidence=High: triggers full Sonnet re-analysis automatically
 - Return ONLY valid JSON, no other text."""
 
 
@@ -787,7 +933,34 @@ def _build_prompt(
         )
         allowed_actions = '"Hold", "Exit", or "Trim".'
 
-    invalidation_block = _build_invalidation_block(original, phase_info)
+    # Suppress the dedicated invalidation section in loss phases — those phase
+    # blocks already ask about thesis validity directly, avoiding double-prompting
+    # that can confuse the model into Exit when loss is normal noise.
+    _LOSS_PHASES = {PHASE_LOSS_MILD, PHASE_LOSS_MODERATE, PHASE_LOSS_DEEP, PHASE_LOSS_CRITICAL}
+    if phase not in _LOSS_PHASES:
+        invalidation_block = _build_invalidation_block(original, phase_info)
+        invalidation_section = f"\n=== THEORY INVALIDATION CHECK ===\n{invalidation_block}\n"
+        theory_fields = (
+            '  "theory_invalidated": false,\n'
+            '  "theory_invalidation_reason": ""\n'
+        )
+        theory_rules = (
+            "- theory_invalidated: true only if the original thesis is definitively broken "
+            "(see check above); if true your action MUST be Exit\n"
+            "- theory_invalidation_reason: 1 sentence on what was specifically invalidated, or empty\n"
+        )
+    else:
+        invalidation_section = ""
+        theory_fields = (
+            '  "theory_invalidated": false,\n'
+            '  "theory_invalidation_reason": ""\n'
+        )
+        theory_rules = (
+            "- theory_invalidated: set to true if — and only if — you determine in your phase "
+            "assessment that the thesis is definitively broken (not just in loss); if true, "
+            "action MUST be Exit\n"
+            "- theory_invalidation_reason: 1 sentence on what was invalidated, or empty\n"
+        )
 
     prompt = f"""\
 You are managing an open {display} position. Review all data below and provide a
@@ -818,10 +991,7 @@ recommendation to protect capital and optimise the trade outcome.
 === PHASE ASSESSMENT ===
 Current phase: {phase.upper()}
 {phase_block}
-
-=== THEORY INVALIDATION CHECK ===
-{invalidation_block}
-
+{invalidation_section}
 Provide your recommendation as JSON:
 {{
   "action": "Hold | Trim | Exit | SetSL | SetTP | SetSLTP",
@@ -831,17 +1001,13 @@ Provide your recommendation as JSON:
   "suggested_sl": null,
   "suggested_tp": null,
   "suggested_trim_pct": null,
-  "theory_invalidated": false,
-  "theory_invalidation_reason": ""
-}}
+{theory_fields}}}
 
 Rules:
 - Allowed actions for this phase: {allowed_actions}
 - suggested_sl / suggested_tp: float prices or null
 - suggested_trim_pct: integer 1-100 (% of position to close), or null
-- theory_invalidated: true only if the original thesis is definitively broken (see check above)
-- theory_invalidation_reason: 1 sentence explaining what specifically was invalidated, or empty
-- Return ONLY valid JSON, no other text."""
+{theory_rules}- Return ONLY valid JSON, no other text."""
 
     return prompt
 
@@ -872,7 +1038,7 @@ def _call_routine_llm(prompt: str, symbol: str) -> dict | None:
                 {"role": "system", "content": system},
                 {"role": "user",   "content": prompt},
             ],
-            max_tokens=200,
+            max_tokens=400,
         )
         raw = resp.choices[0].message.content.strip()
         logger.debug(f"Routine check [{symbol}]: Azure {deployment}")
@@ -884,7 +1050,7 @@ def _call_routine_llm(prompt: str, symbol: str) -> dict | None:
         try:
             msg = _get_client().messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=200,
+                max_tokens=400,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -911,7 +1077,7 @@ def _call_llm(prompt: str, symbol: str) -> dict | None:
     try:
         message = _get_client().messages.create(
             model=config.ANALYSIS_MODEL,
-            max_tokens=512,
+            max_tokens=800,
             system=(
                 f"You are a professional {display} forex risk manager. "
                 "Your job is to protect open positions and optimise trade outcomes. "
@@ -1085,10 +1251,9 @@ def analyze_position(pos: dict, portfolio: dict) -> dict[str, Any] | None:
     tick    = get_current_tick(symbol=symbol)
 
     try:
-        market_context = build_context(trigger_item=None, symbol=symbol)
-        market_context = market_context[:2000]
+        market_context = _build_job2_news_context(symbol)
     except Exception as e:
-        logger.warning(f"Context build failed: {e}")
+        logger.warning(f"Job2 news context failed: {e}")
         market_context = "(market context unavailable)"
 
     # 6. Build phase-specific prompt and call LLM
