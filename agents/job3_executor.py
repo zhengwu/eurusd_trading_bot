@@ -104,7 +104,10 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
         equity_pre = _get_equity()
         if equity_pre is not None:
             from mt5.portfolio_risk import check_portfolio_risk
-            risk_check = check_portfolio_risk(direction, symbol, equity_pre)
+            risk_check = check_portfolio_risk(
+                direction, symbol, equity_pre,
+                new_risk_pct=signal.get("_recommended_risk_pct"),
+            )
             if not risk_check["ok"]:
                 logger.warning(
                     f"Portfolio risk blocked signal {signal.get('id', '?')}: "
@@ -144,12 +147,11 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
                 return {"ok": False, "error": msg}
             logger.info(f"[{symbol}] R:R {rr:.2f} — passed minimum {config.JOB3_MIN_RR}")
 
-        account_info = _get_equity()
-        if account_info is None:
+        if equity_pre is None:
             return {"ok": False, "error": "Cannot read account equity"}
 
         lot = signal.get("_lot_override") or calculate_lot_size(
-            account_info, config.JOB3_RISK_PCT, sl_pips, symbol=symbol
+            equity_pre, config.JOB3_RISK_PCT, sl_pips, symbol=symbol
         )
         logger.info(
             f"[{symbol}] Lot sizing: {'recommended=' + str(signal.get('_lot_override')) if signal.get('_lot_override') else 'fallback (base ' + str(config.JOB3_RISK_PCT) + '%)'} → {lot} lots"
@@ -277,12 +279,12 @@ def compute_order_preview(signal: dict[str, Any], symbol: str | None = None) -> 
             lot = float(lot_override)
         else:
             lot = calculate_lot_size(equity or 10000.0, config.JOB3_RISK_PCT, sl_pips, symbol=sym)
-        risk_pct_used = signal.get("_recommended_risk_pct", config.JOB3_RISK_PCT)
-        risk_amount = round((equity or 0) * risk_pct_used / 100, 2)
+        pip_value = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["pip_value_per_lot"]
+        risk_amount = round(lot * sl_pips * pip_value, 2)
 
         tp_pips = abs(tp_price - current_price) / pip if tp_price else None
         rr = round(tp_pips / sl_pips, 2) if tp_pips and sl_pips > 0 else None
-        rr_warning = rr is not None and rr < 1.5
+        rr_warning = rr is not None and rr < config.JOB3_RR_WARNING
 
         return {
             "entry_price": round(current_price, decimals),

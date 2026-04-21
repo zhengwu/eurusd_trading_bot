@@ -125,7 +125,12 @@ def get_portfolio_summary(equity: float) -> dict:
     return summary
 
 
-def check_portfolio_risk(direction: str, symbol: str, equity: float) -> dict:
+def check_portfolio_risk(
+    direction: str,
+    symbol: str,
+    equity: float,
+    new_risk_pct: float | None = None,
+) -> dict:
     """
     Gate for new Long/Short entries. Checks three limits in order:
       1. Max open trade count
@@ -133,9 +138,11 @@ def check_portfolio_risk(direction: str, symbol: str, equity: float) -> dict:
       3. Max correlated (same USD-bucket) risk %
 
     Args:
-      direction — "buy" or "sell"
-      symbol    — e.g. "EURUSD"
-      equity    — current account equity in USD
+      direction    — "buy" or "sell"
+      symbol       — e.g. "EURUSD"
+      equity       — current account equity in USD
+      new_risk_pct — actual uncertainty-scaled risk % for the new trade.
+                     Falls back to JOB3_RISK_PCT (base) when not provided.
 
     Returns:
       {"ok": True,  "summary": {...}}
@@ -143,7 +150,7 @@ def check_portfolio_risk(direction: str, symbol: str, equity: float) -> dict:
     """
     summary      = get_portfolio_summary(equity)
     new_bucket   = _usd_bucket(symbol, direction)
-    new_risk_pct = config.JOB3_RISK_PCT
+    new_risk_pct = new_risk_pct if new_risk_pct is not None else config.JOB3_RISK_PCT
 
     # 1. Hard position count cap
     if summary["open_count"] >= config.JOB3_MAX_OPEN_TRADES:

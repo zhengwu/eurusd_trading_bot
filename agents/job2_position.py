@@ -89,9 +89,11 @@ _HORIZON_HOURS: dict[str, float] = {
 _DEFAULT_HORIZON_HOURS = 24.0
 
 # Phase labels
-PHASE_LOSS_DEEP = "loss_deep"   # R < JOB2_LOSS_DEEP_R  — approaching SL, urgent review
-PHASE_LOSS_MILD = "loss_mild"   # JOB2_LOSS_DEEP_R ≤ R < 0 — in loss but within noise range
-PHASE_EARLY     = "early"       # 0 ≤ R < JOB2_BREAKEVEN_R — in profit but not yet breakeven
+PHASE_LOSS_CRITICAL = "loss_critical"  # R < JOB2_LOSS_DEEP_R — near SL, exit-biased
+PHASE_LOSS_DEEP     = "loss_deep"      # JOB2_LOSS_DEEP_R ≤ R < JOB2_LOSS_MODERATE_R — partial close eligible
+PHASE_LOSS_MODERATE = "loss_moderate"  # JOB2_LOSS_MODERATE_R ≤ R < JOB2_LOSS_MILD_R — alert, thesis review
+PHASE_LOSS_MILD     = "loss_mild"      # JOB2_LOSS_MILD_R ≤ R < 0 — normal noise, monitor
+PHASE_EARLY         = "early"          # 0 ≤ R < JOB2_BREAKEVEN_R — not yet breakeven
 PHASE_BREAKEVEN = "breakeven"   # JOB2_BREAKEVEN_R ≤ R < JOB2_PARTIAL_TP_R
 PHASE_PROFIT    = "profit"      # JOB2_PARTIAL_TP_R ≤ R < JOB2_TRAIL_R
 PHASE_TRAIL     = "trail"       # R ≥ JOB2_TRAIL_R
@@ -242,10 +244,14 @@ def _compute_phase(pos: dict, original: dict | None) -> dict:
         phase = PHASE_BREAKEVEN
     elif current_r >= 0:
         phase = PHASE_EARLY
-    elif current_r >= config.JOB2_LOSS_DEEP_R:
+    elif current_r >= config.JOB2_LOSS_MILD_R:
         phase = PHASE_LOSS_MILD
-    else:
+    elif current_r >= config.JOB2_LOSS_MODERATE_R:
+        phase = PHASE_LOSS_MODERATE
+    elif current_r >= config.JOB2_LOSS_DEEP_R:
         phase = PHASE_LOSS_DEEP
+    else:
+        phase = PHASE_LOSS_CRITICAL
 
     return {
         "phase":             phase,
@@ -537,31 +543,79 @@ def _build_prompt(
         safeguard_note += f"\n⚠ NEWS BLACKOUT: {blackout_event} is imminent — do NOT recommend SL/TP modifications."
 
     # Phase-specific question block
-    if phase == PHASE_LOSS_DEEP:
+    if phase == PHASE_LOSS_CRITICAL:
         pct_to_sl = round(abs(phase_info["current_r"]) * 100)
         phase_block = (
-            f"The trade is at {phase_info['current_r']:.2f}R — {pct_to_sl}% of the way to the stop loss.\n"
-            "This is an URGENT review. Focus on:\n"
-            "1. Has the original thesis been invalidated by current market conditions or news?\n"
-            "2. Is this drawdown a directional move against you, or temporary noise within ATR range?\n"
-            "   (Check ATR-M15 vs the current pip loss — is the move > 1.5× ATR?)\n"
-            "3. Is momentum (RSI, MACD, M15 bias) confirming continuation against you?\n"
-            "If the thesis is broken OR the move is clearly directional: recommend Exit to preserve capital.\n"
-            "If this is noise within ATR range AND the thesis is intact: Hold may be justified, but explain specifically."
+            f"The trade is at {phase_info['current_r']:.2f}R — CRITICAL. "
+            f"{pct_to_sl}% of the way to the stop loss.\n"
+            "This is a near-SL situation requiring an immediate binary decision. Focus on:\n"
+            "1. Has the original thesis been definitively invalidated by price action or news?\n"
+            "2. Is this drawdown clearly directional? (pip loss > 2× ATR-M15 = directional)\n"
+            "3. Is momentum (RSI, MACD, M15 bias) strongly confirming continuation against you?\n"
+            "If thesis is broken OR the move is clearly directional: recommend Exit immediately.\n"
+            "If this is extreme noise within the original thesis: Hold requires overwhelming specific evidence. "
+            "No partial closes here — make a binary decision."
         )
-        allowed_actions = '"Exit" (strongly preferred if thesis broken) or "Hold" (must cite specific thesis evidence and ATR context). No Trim or SL moves — position needs a binary decision.'
+        allowed_actions = (
+            '"Exit" (strongly preferred — thesis broken or directional move confirmed) or '
+            '"Hold" (must cite overwhelming thesis evidence and ATR context). '
+            "No Trim — binary decision only."
+        )
+
+    elif phase == PHASE_LOSS_DEEP:
+        pct_to_sl = round(abs(phase_info["current_r"]) * 100)
+        trim_pct  = int(config.JOB2_LOSS_DEEP_TRIM_PCT)
+        phase_block = (
+            f"The trade is at {phase_info['current_r']:.2f}R — deep loss zone. "
+            f"{pct_to_sl}% of the way to the stop loss.\n"
+            "The original stop is at meaningful risk. Focus on:\n"
+            "1. Has the thesis been materially weakened, even if not fully broken?\n"
+            "2. Is this a measured pullback or a directional breakdown? (ATR-M15 × 1.5 rule)\n"
+            f"3. Would a partial close ({trim_pct}%) meaningfully reduce dollar risk while preserving "
+            "upside if the thesis recovers?\n"
+            f"Partial close ({trim_pct}%) is preferred over a full hold when uncertain. "
+            "If the thesis is clearly broken, recommend full Exit."
+        )
+        allowed_actions = (
+            f'"Exit" (thesis broken), '
+            f'"Trim" (partial close {trim_pct}% to reduce risk — requires your approval), or '
+            '"Hold" (must cite specific evidence the thesis remains intact and loss is within ATR noise).'
+        )
+
+    elif phase == PHASE_LOSS_MODERATE:
+        pct_to_sl = round(abs(phase_info["current_r"]) * 100)
+        phase_block = (
+            f"The trade is at {phase_info['current_r']:.2f}R — early warning zone. "
+            f"{pct_to_sl}% of the way to the stop loss.\n"
+            "This warrants a thesis review. Focus on:\n"
+            "1. Is the pullback directional or noise? Compare pip loss to ATR-M15.\n"
+            "2. Has any news or price action since entry weakened the original thesis?\n"
+            "3. Are momentum indicators (RSI-M15, MACD histogram) turning against the trade direction?\n"
+            "If two or more checks show deterioration: recommend Exit to preserve capital early.\n"
+            "Otherwise Hold is justified — but state specifically what evidence supports the thesis."
+        )
+        allowed_actions = (
+            '"Hold" (thesis intact, deterioration not confirmed) or '
+            '"Exit" (early deterioration evident). '
+            "No Trim at this stage."
+        )
 
     elif phase == PHASE_LOSS_MILD:
         pct_to_sl = round(abs(phase_info["current_r"]) * 100)
         phase_block = (
-            f"The trade is at {phase_info['current_r']:.2f}R — {pct_to_sl}% of the way to the stop loss.\n"
-            "This is within the normal noise range. Focus on:\n"
-            "1. Is the original thesis still intact? Has any news or price action undermined it?\n"
-            "2. Is the current pullback normal retracement, or is momentum turning against the trade?\n"
+            f"The trade is at {phase_info['current_r']:.2f}R — within normal noise range. "
+            f"{pct_to_sl}% of the way to the stop loss.\n"
+            "Focus on:\n"
+            "1. Is the original thesis still intact? Any news or price action undermining it?\n"
+            "2. Is the pullback normal retracement, or is momentum beginning to turn?\n"
             "   (Use RSI-M15, MACD histogram direction, and M15 momentum bias as evidence.)\n"
-            "3. Is there a reason to exit early, or is the original SL placement still valid?"
+            "3. Is the original SL placement still valid given current volatility (ATR-M15)?"
         )
-        allowed_actions = '"Hold" (thesis intact, noise within ATR) or "Exit" (thesis weakening). Do NOT suggest Trim or SL/TP changes for a losing position.'
+        allowed_actions = (
+            '"Hold" (thesis intact, noise within ATR) or '
+            '"Exit" (thesis weakening). '
+            "Do NOT suggest Trim or SL/TP changes for a losing position."
+        )
 
     elif phase == PHASE_EARLY:
         phase_block = (
@@ -750,7 +804,12 @@ def _build_trigger(pos: dict, rec: dict, phase_info: dict) -> dict[str, Any]:
             f"{direction} {pos.get('volume')}L @ {pos.get('open_price')} | "
             f"P&L: {profit_str}{r_str} | Phase: {phase_info['phase'].upper()}"
         ),
-        "score": 8 if action == "Exit" else 6 if action in ("Trim", "SetSL") else 4,
+        "score": (
+            8 if phase_info.get("phase") == PHASE_LOSS_CRITICAL or action == "Exit"
+            else 7 if phase_info.get("phase") == PHASE_LOSS_DEEP
+            else 6 if action in ("Trim", "SetSL")
+            else 4
+        ),
         "tag":   "position_monitor",
     }
 
@@ -965,9 +1024,13 @@ def _r_to_phase_simple(current_r: float) -> str:
         return PHASE_BREAKEVEN
     if current_r >= 0:
         return PHASE_EARLY
-    if current_r >= config.JOB2_LOSS_DEEP_R:
+    if current_r >= config.JOB2_LOSS_MILD_R:
         return PHASE_LOSS_MILD
-    return PHASE_LOSS_DEEP
+    if current_r >= config.JOB2_LOSS_MODERATE_R:
+        return PHASE_LOSS_MODERATE
+    if current_r >= config.JOB2_LOSS_DEEP_R:
+        return PHASE_LOSS_DEEP
+    return PHASE_LOSS_CRITICAL
 
 
 def _watcher_compute_r(pos: dict) -> float | None:
@@ -1152,6 +1215,8 @@ def main() -> None:
     logger.info("EUR/USD Position Monitor — Job 2 (Phase Engine)")
     logger.info(f"  Analysis model    : {config.ANALYSIS_MODEL}")
     logger.info(f"  Check interval    : {config.JOB2_CHECK_INTERVAL_MINUTES} min")
+    logger.info(f"  Loss stages       : mild>{config.JOB2_LOSS_MILD_R}R  moderate>{config.JOB2_LOSS_MODERATE_R}R  deep>{config.JOB2_LOSS_DEEP_R}R  critical=below")
+    logger.info(f"  Loss-deep trim    : {config.JOB2_LOSS_DEEP_TRIM_PCT}%")
     logger.info(f"  Breakeven R       : {config.JOB2_BREAKEVEN_R}R  (buffer: {config.JOB2_BREAKEVEN_BUFFER_PIPS}p)")
     logger.info(f"  Partial TP R      : {config.JOB2_PARTIAL_TP_R}R  ({config.JOB2_PARTIAL_TP_PCT}% trim)")
     logger.info(f"  Trail R           : {config.JOB2_TRAIL_R}R  (ATR × {config.JOB2_TRAIL_ATR_MULT})")

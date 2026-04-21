@@ -215,8 +215,11 @@ def get_pair(symbol: str) -> dict:
 JOB2_CHECK_INTERVAL_MINUTES  = 30    # How often Job 2 checks open positions
 
 # Phase engine thresholds (R-multiples relative to original SL distance)
-JOB2_LOSS_DEEP_R             = -0.5  # Below this → LOSS_DEEP (approaching SL, urgent review)
-                                     # Between this and 0 → LOSS_MILD (normal noise range)
+JOB2_LOSS_MILD_R             = -0.3  # 0 to this → LOSS_MILD (normal noise, monitor)
+JOB2_LOSS_MODERATE_R         = -0.5  # mild to this → LOSS_MODERATE (alert, thesis review)
+JOB2_LOSS_DEEP_R             = -0.7  # moderate to this → LOSS_DEEP (partial close eligible)
+                                     # Below this → LOSS_CRITICAL (near SL, exit-biased)
+JOB2_LOSS_DEEP_TRIM_PCT      = 50.0  # Suggested partial close % at LOSS_DEEP stage
 JOB2_BREAKEVEN_R             = 1.0   # Move SL to breakeven when trade reaches this R
 JOB2_BREAKEVEN_BUFFER_PIPS   = 3     # Set breakeven SL this many pips beyond entry (not at exact entry)
 JOB2_PARTIAL_TP_R            = 1.5   # Suggest partial trim when trade reaches this R
@@ -242,21 +245,18 @@ JOB3_MAX_LOT                 = 5.0   # Maximum lot size
 JOB3_DEFAULT_SL_PIPS         = 30    # Fallback SL if key_levels missing
 JOB3_DEFAULT_TP_PIPS         = 60    # Fallback TP if key_levels missing
 
-# Minimum risk:reward ratio required to execute a Long or Short signal.
+# Risk:reward thresholds — two separate levels with distinct roles:
 #
-# R:R = TP distance (pips) / SL distance (pips)
-# A ratio of 1.0 means TP and SL are equidistant from entry — every winning trade
-# exactly offsets one losing trade, so the strategy breaks even at 50% win rate.
+#   JOB3_MIN_RR      — hard execution block. Signals below this are rejected at execution
+#                      time regardless of approval. Set to a genuine floor (not near-zero)
+#                      to prevent clearly negative-edge trades.
 #
-# Why 1.0 and not higher?
-#   A tighter filter (e.g. 1.5) rejects more setups and improves average trade quality,
-#   but also means fewer signals. 1.0 is a floor — it blocks only clearly negative-edge
-#   setups (TP < SL) where you risk more than you can win. Once calibration data from
-#   outcome_log.json accumulates, raise this to 1.2–1.5 if win rate data supports it.
-#
-# Signals that fail this check are rejected at execution time (Job 3) and are also
-# filtered upstream in the analysis prompt, so the LLM should not generate them at all.
-JOB3_MIN_RR                  = 1.0   # Minimum TP/SL ratio — block execution below this
+#   JOB3_RR_WARNING  — soft visual warning. When computed R:R is below this, a ⚠ is shown
+#                      in the Slack order preview and the analysis prompt instructs the model
+#                      to flag it in risk_note. The trade can still be approved and executed.
+#                      Raise to 2.0 once calibration data supports it.
+JOB3_MIN_RR                  = 0.4    # Hard block: execution rejected below this R:R
+JOB3_RR_WARNING              = 1.0    # Soft warn: ⚠ shown in Slack preview below this R:R
 JOB3_SIGNAL_EXPIRY_MINUTES   = 60    # Signal auto-expires if not approved in time
 
 # Uncertainty-based lot sizing — risk % multipliers by uncertainty tier
@@ -276,8 +276,8 @@ JOB3_AUTO_APPROVE_MAX_UNCERTAINTY: int | None = 30
 
 # Portfolio-level risk limits (applied before opening any new Long/Short)
 JOB3_MAX_OPEN_TRADES         = 3     # Hard cap on concurrent positions across all pairs
-JOB3_MAX_PORTFOLIO_RISK_PCT  = 3.0   # Max total risk (open positions + new trade) as % of equity
-JOB3_MAX_CORRELATED_RISK_PCT = 2.0   # Max risk within same USD-direction bucket (usd_long/usd_short)
+JOB3_MAX_PORTFOLIO_RISK_PCT  = 5.0   # Max total risk (open positions + new trade) as % of equity
+JOB3_MAX_CORRELATED_RISK_PCT = 3.0   # Max risk within same USD-direction bucket (usd_long/usd_short)
 
 # ── Price assets to track (legacy — superseded by PAIRS[symbol]["correlations"]) ──
 PRICE_ASSETS = {
