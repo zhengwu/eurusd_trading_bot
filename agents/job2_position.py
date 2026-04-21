@@ -536,6 +536,42 @@ def _fmt_original_signal(original: dict | None) -> str:
     )
 
 
+def _fmt_derived_metrics(pos: dict, phase_info: dict, indicators: dict) -> str:
+    """
+    Pre-computed derived metrics that avoid requiring arithmetic in LLM reasoning.
+    Injects: ATR in pips, directional threshold (2× ATR), pip-vs-threshold comparison,
+    hours remaining in expected horizon.
+    """
+    symbol   = pos.get("symbol", config.MT5_SYMBOL)
+    pip      = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
+    lines: list[str] = []
+
+    # ATR-M15 in pips
+    atr_raw = indicators.get("atr_m15")
+    if atr_raw:
+        atr_pips = round(atr_raw / pip, 1)
+        thresh   = round(atr_pips * 2, 1)
+        pip_loss = phase_info.get("pips_profit", 0.0)
+        if pip_loss < 0:
+            verdict = "DIRECTIONAL (> 2× ATR)" if abs(pip_loss) >= thresh else f"noise ({abs(pip_loss):.1f}p < {thresh}p threshold)"
+            lines.append(f"  ATR-M15        : {atr_pips}p  |  Directional threshold: {thresh}p  |  Current move: {pip_loss:+.1f}p — {verdict}")
+        else:
+            lines.append(f"  ATR-M15        : {atr_pips}p  |  Directional threshold: {thresh}p")
+    else:
+        lines.append("  ATR-M15        : (unavailable)")
+
+    # Hours remaining
+    hours_in  = phase_info.get("hours_in_trade", 0.0)
+    hours_exp = phase_info.get("expected_hours", _DEFAULT_HORIZON_HOURS)
+    remaining = hours_exp - hours_in
+    if remaining > 0:
+        lines.append(f"  Time remaining : {remaining:.1f}h of {hours_exp:.0f}h expected horizon")
+    else:
+        lines.append(f"  Time remaining : OVERDUE by {abs(remaining):.1f}h (expected {hours_exp:.0f}h, open {hours_in:.1f}h)")
+
+    return "\n".join(lines)
+
+
 # ── theory invalidation check ────────────────────────────────────────────────
 
 def _build_invalidation_block(original: dict | None, phase_info: dict) -> str:
@@ -740,14 +776,24 @@ def _build_routine_prompt(
         phase_note = f"Phase: {phase.upper()} at {r_str}."
         allowed    = '"Hold" or "Exit".'
 
-    news_section  = _build_recent_news_brief(symbol)
-    price_section = _build_session_price_brief(symbol)
+    news_section    = _build_recent_news_brief(symbol)
+    price_section   = _build_session_price_brief(symbol)
+    derived_section = _fmt_derived_metrics(pos, phase_info, indicators)
 
     return f"""\
-Routine {display} position check — indicators + news based assessment.
+=== ASSESSMENT APPROACH ===
+You are doing a routine check on an open {display} position. Answer these questions to form your decision:
+1. Thesis alignment: Does current price action, momentum, and market context support or oppose the original trade thesis?
+2. News impact: Does any recent headline materially reverse the original trade catalyst? (Score >= 7 = material)
+3. Phase fit: Is the R-multiple and price action consistent with holding through to the original target?
+4. Escalation need: Does this situation require deeper analysis (phase change, conflicting signals, near invalidation)?
+Capture your conclusions across all four questions in "reasoning_summary".
 
 === POSITION ===
 {_fmt_position(pos, phase_info)}
+
+=== DERIVED METRICS ===
+{derived_section}
 
 === TECHNICAL INDICATORS ===
 {_fmt_indicators(indicators)}
@@ -764,26 +810,24 @@ Routine {display} position check — indicators + news based assessment.
 === PHASE ===
 {phase.upper()} at {r_str} — {phase_note}
 
-=== ASSESSMENT APPROACH ===
-Evaluate these three questions to form your decision:
-1. Indicator alignment: Do RSI-M15, MACD histogram, and M15 momentum support or oppose the trade direction?
-2. News impact: Does any recent headline materially reverse the original trade catalyst?
-3. Phase fit: Is the R-multiple and price action consistent with holding through to the original target?
-Capture your conclusions in "reasoning_summary" inside the JSON.
-
 Return ONLY valid JSON:
 {{
-  "reasoning_summary": "3 short sentences covering: indicator verdict, news impact, phase assessment",
+  "reasoning_summary": "4 short sentences: thesis alignment verdict, news impact verdict, phase fit verdict, escalation need verdict",
+  "thesis_alignment": "supporting | neutral | opposing",
+  "news_impact": "none | minor | significant_adverse | significant_supportive",
   "action": "Hold | Exit | Trim",
   "confidence": "High | Medium | Low",
-  "rationale": "1-2 sentences referencing specific numbers (RSI, pips, news headline)",
-  "suggested_trim_pct": null
+  "rationale": "1-2 sentences referencing specific numbers (RSI, pips, ATR, news headline)",
+  "suggested_trim_pct": null,
+  "requires_full_analysis": false,
+  "requires_full_analysis_reason": ""
 }}
 
 Rules:
 - Allowed actions: {allowed}
 - No SL/TP modifications in routine checks — those require full analysis
-- If action=Exit AND confidence=High: triggers full Sonnet re-analysis automatically
+- requires_full_analysis=true triggers Sonnet re-analysis (use for near-invalidation, phase change, or significant conflicting signals)
+- If action=Exit AND confidence=High: also triggers full Sonnet re-analysis automatically
 - Return ONLY valid JSON, no other text."""
 
 
@@ -990,6 +1034,9 @@ recommendation to protect capital and optimise the trade outcome.
 === POSITION ===
 {_fmt_position(pos, phase_info)}
 
+=== DERIVED METRICS ===
+{_fmt_derived_metrics(pos, phase_info, indicators)}
+
 === ACCOUNT ===
 {_fmt_account(account)}
 
@@ -1001,7 +1048,7 @@ recommendation to protect capital and optimise the trade outcome.
 
 === ORIGINAL TRADE THESIS ===
 {_fmt_original_signal(original)}
-
+{invalidation_section}
 === PORTFOLIO CONTEXT (other open positions) ===
 {_fmt_portfolio(portfolio, pos.get('ticket', -1))}
 
@@ -1011,9 +1058,12 @@ recommendation to protect capital and optimise the trade outcome.
 === PHASE ASSESSMENT ===
 Current phase: {phase.upper()}
 {phase_block}
-{invalidation_section}
+
 Provide your recommendation as JSON:
 {{
+  "thesis_status": "intact | weakened | broken",
+  "move_character": "noise | directional",
+  "news_assessment": "neutral | supporting | opposing",
   "action": "Hold | Trim | Exit | SetSL | SetTP | SetSLTP",
   "confidence": "High | Medium | Low",
   "rationale": "2-3 sentences referencing specific position and market data",
@@ -1024,6 +1074,9 @@ Provide your recommendation as JSON:
 {theory_fields}}}
 
 Rules:
+- thesis_status: assess whether the original thesis still holds given current market evidence
+- move_character: use derived metrics above — "directional" if pip move >= 2× ATR threshold
+- news_assessment: does recent context support, oppose, or not affect the original catalyst?
 - Allowed actions for this phase: {allowed_actions}
 - suggested_sl / suggested_tp: float prices or null
 - suggested_trim_pct: integer 1-100 (% of position to close), or null
@@ -1040,7 +1093,11 @@ def _call_routine_llm(prompt: str, symbol: str) -> dict | None:
     Tries Azure GPT-5.2 first (free for user); falls back to Claude Haiku.
     """
     display = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["display"]
-    system  = f"You are a {display} forex position manager. Be concise and precise."
+    system  = (
+        f"You are a professional {display} forex risk manager with a primary duty to protect capital. "
+        "Your decisions affect real money. Be specific, cite numbers, and flag genuine risks clearly. "
+        "Hold only when the evidence clearly supports it — never as a default."
+    )
 
     raw: str | None = None
 
@@ -1058,7 +1115,7 @@ def _call_routine_llm(prompt: str, symbol: str) -> dict | None:
                 {"role": "system", "content": system},
                 {"role": "user",   "content": prompt},
             ],
-            max_tokens=400,
+            max_tokens=500,
         )
         raw = resp.choices[0].message.content.strip()
         logger.debug(f"Routine check [{symbol}]: Azure {deployment}")
@@ -1070,7 +1127,7 @@ def _call_routine_llm(prompt: str, symbol: str) -> dict | None:
         try:
             msg = _get_client().messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=400,
+                max_tokens=500,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -1097,15 +1154,21 @@ def _call_llm(prompt: str, symbol: str) -> dict | None:
     try:
         message = _get_client().messages.create(
             model=config.ANALYSIS_MODEL,
-            max_tokens=800,
+            max_tokens=4000,
+            thinking={"type": "enabled", "budget_tokens": 3000},
             system=(
-                f"You are a professional {display} forex risk manager. "
-                "Your job is to protect open positions and optimise trade outcomes. "
-                "Be precise and reference specific numbers from the data provided."
+                f"You are a senior {display} forex risk manager responsible for protecting open positions and capital. "
+                "You have deep expertise in technical analysis, macro fundamentals, and trade management. "
+                "Your primary duty is capital protection — never rationalise holding a losing position unless the thesis is unambiguously intact. "
+                "Think step by step: evaluate the original thesis, current market evidence, and phase context before reaching a conclusion. "
+                "Be precise: always reference specific numbers (RSI, pips, ATR, R-multiple) in your rationale."
             ),
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = message.content[0].text.strip()
+        # With thinking enabled, content is [ThinkingBlock, TextBlock].
+        # Find the text block explicitly — content[0] would be the thinking block.
+        text_block = next(b for b in message.content if b.type == "text")
+        raw = text_block.text.strip()
     except Exception as e:
         logger.error(f"Job 2 LLM call failed: {e}")
         return None
@@ -1361,11 +1424,14 @@ def analyze_position_routine(pos: dict, portfolio: dict) -> dict | None:
     if rec is None:
         return None
 
-    # Escalate to full Sonnet if cheap model signals Exit with High confidence
-    if rec.get("action") == "Exit" and rec.get("confidence") == "High":
-        logger.info(
-            f"#{ticket} Routine Exit [High] — escalating to full Sonnet analysis"
-        )
+    # Escalate to full Sonnet if cheap model requests it or signals Exit [High]
+    _needs_escalation = (
+        rec.get("requires_full_analysis") is True
+        or (rec.get("action") == "Exit" and rec.get("confidence") == "High")
+    )
+    if _needs_escalation:
+        _reason = rec.get("requires_full_analysis_reason") or "Exit [High confidence]"
+        logger.info(f"#{ticket} Routine escalation — {_reason} — escalating to full Sonnet analysis")
         full_rec = analyze_position(pos, portfolio)
         if full_rec:
             full_rec["_escalated_from_routine"] = True
@@ -1402,12 +1468,14 @@ def _notify_routine_hold(pos: dict, rec: dict) -> None:
         rationale = _cut + "…"
     else:
         rationale = _rat_raw
-    confidence = rec.get("confidence", "?")
+    confidence      = rec.get("confidence", "?")
+    thesis_align    = rec.get("thesis_alignment", "")
+    align_str       = f" | thesis={thesis_align}" if thesis_align else ""
 
     notify_text(
         f"\U0001f554 Routine #{ticket} {direction} {symbol}"
         f" | {profit_str}{r_str} | {phase.upper()}"
-        f" | Hold [{confidence}] — {rationale}"
+        f" | Hold [{confidence}]{align_str} — {rationale}"
     )
     logger.info(f"#{ticket} [{phase}] Routine Hold notified (compact)")
 

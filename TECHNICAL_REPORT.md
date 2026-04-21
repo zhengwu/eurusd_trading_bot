@@ -980,24 +980,32 @@ Open position (MT5)
 
   ┌─ Routine (every 30 min) ───────────────────────────────────┐
   │  Model: Azure GPT-5.2 (Haiku fallback)                     │
-  │  Prompt: position + indicators + session prices +          │
-  │          last 6 headlines + structured assessment approach  │
-  │  Output: reasoning_summary + action + confidence           │
+  │  Prompt (questions-first design):                           │
+  │    Assessment approach (4 explicit questions) at TOP        │
+  │    position + derived metrics + indicators + session prices │
+  │    last 6 headlines + original thesis + phase              │
+  │  Output: reasoning_summary + thesis_alignment + news_impact │
+  │          action + confidence + rationale                    │
+  │          requires_full_analysis (bool) + reason            │
   │                                                             │
-  │  action=Exit AND confidence=High?                           │
+  │  requires_full_analysis=true OR (Exit AND High confidence)? │
   │    yes → escalate to full Sonnet analysis                   │
   │    no  → Hold: compact one-liner Slack notification        │
   │          Exit/Trim: save pending, full Slack alert          │
   └─────────────────────────────────────────────────────────────┘
 
   ┌─ Priority (phase transitions, escalations) ────────────────┐
-  │  Model: Claude Sonnet (ANALYSIS_MODEL)                      │
-  │  Prompt: position + account + tick + indicators +           │
-  │          original thesis + portfolio context +              │
+  │  Model: Claude Sonnet (ANALYSIS_MODEL) + extended thinking  │
+  │         (budget_tokens=3000, max_tokens=4000)               │
+  │  Prompt: position + derived metrics + account + tick +      │
+  │          indicators + original thesis +                     │
+  │          theory invalidation check (non-loss, after thesis) │
+  │          portfolio context +                                │
   │          targeted news context (_build_job2_news_context):  │
   │            last 8 headlines + released events + 5 assets   │
-  │  Non-loss phases: theory invalidation check (see below)    │
-  │  Output: action + confidence + rationale + suggested SL/TP │
+  │          phase assessment block                             │
+  │  Output: thesis_status + move_character + news_assessment   │
+  │          action + confidence + rationale + suggested SL/TP  │
   │                                                             │
   │  theory_invalidated=true → force Exit regardless of phase  │
   │  Exit / Trim → save pending, full Slack alert              │
@@ -1052,39 +1060,74 @@ R-multiple is computed as: `pips_in_profit / original_sl_pips`. `original_sl_pip
 
 #### Routine prompt (`_build_routine_prompt`)
 
-Sent to Azure GPT-5.2 / Haiku. Estimated ~600 tokens. Sections:
+Sent to Azure GPT-5.2 / Haiku (max_tokens=500). Sections, in order:
 
-1. **Position** — direction, volume, entry, current price, pips, R-multiple, net P&L, SL/TP, time in trade
-2. **Technical Indicators** — ATR-M15, RSI-M15, MACD histogram, M15 momentum bias
-3. **Session Prices** — symbol + DXY + US10Y with today's % change (compact single line)
-4. **Recent News** — last 6 scored headlines for this pair today (`[time] [score] headline`)
-5. **Original Trade Thesis** — rationale, invalidation condition, time horizon from trade journal
-6. **Phase** — current phase + R + phase-specific question
-7. **Assessment Approach** — three explicit questions the model must evaluate:
-   - Indicator alignment: do RSI, MACD, M15 bias support or oppose the trade?
-   - News impact: does any headline materially reverse the original catalyst?
+1. **Assessment Approach** (at TOP — questions-first design) — four explicit questions the model must answer before seeing data:
+   - Thesis alignment: does current price action, momentum, and context support or oppose the original thesis?
+   - News impact: does any headline materially reverse the original catalyst? (score ≥ 7 = material)
    - Phase fit: is the R-multiple consistent with holding to target?
+   - Escalation need: does this situation require deeper Sonnet analysis?
+2. **Position** — direction, volume, entry, current price, pips, R-multiple, net P&L, SL/TP, time in trade
+3. **Derived Metrics** (`_fmt_derived_metrics`) — ATR-M15 in pips, directional threshold (2× ATR), current pip move vs threshold verdict ("noise" or "DIRECTIONAL"), hours remaining in expected horizon. Pre-computed to avoid arithmetic errors in reasoning.
+4. **Technical Indicators** — ATR-M15, RSI-M15, MACD histogram, M15 momentum bias
+5. **Session Prices** — symbol + DXY + US10Y with today's % change
+6. **Recent News** — last 6 scored headlines for this pair today (`[time] [score] headline`)
+7. **Original Trade Thesis** — rationale, invalidation condition, time horizon from trade journal
+8. **Phase** — current phase + R + phase-specific question
 
-JSON output includes `reasoning_summary` (3 sentences covering all three assessments) alongside `action`, `confidence`, `rationale`, `suggested_trim_pct`. The `reasoning_summary` provides an audit trail of why the model reached its decision.
+JSON output schema:
+
+```json
+{
+  "reasoning_summary": "4 sentences: thesis alignment, news impact, phase fit, escalation need",
+  "thesis_alignment": "supporting | neutral | opposing",
+  "news_impact": "none | minor | significant_adverse | significant_supportive",
+  "action": "Hold | Exit | Trim",
+  "confidence": "High | Medium | Low",
+  "rationale": "1-2 sentences referencing specific numbers",
+  "suggested_trim_pct": null,
+  "requires_full_analysis": false,
+  "requires_full_analysis_reason": ""
+}
+```
+
+`requires_full_analysis=true` causes the routine path to immediately escalate to full Sonnet analysis without committing to an Exit recommendation — used for near-invalidation, unexpected phase transitions, or conflicting signals that warrant deeper reasoning. The `Exit AND confidence=High` path remains as a fallback escalation trigger.
 
 #### Priority prompt (`_build_prompt`)
 
-Sent to Claude Sonnet. Sections:
+Sent to Claude Sonnet with extended thinking enabled (budget_tokens=3000, max_tokens=4000). Sections, in order:
 
 1. **Position** — full enriched detail (same as routine)
-2. **Account** — equity, balance, free margin, margin level, drawdown
-3. **Market Snapshot** — live bid/ask/spread, current EST time
-4. **Technical Indicators** — same as routine
-5. **Original Trade Thesis** — full rationale, invalidation, risk note (up to 300 chars)
-6. **Portfolio Context** — other open positions with USD-direction bucket and risk %
-7. **Recent Market Context** (`_build_job2_news_context`):
+2. **Derived Metrics** (`_fmt_derived_metrics`) — same pre-computed ATR/threshold/time-remaining block as the routine prompt
+3. **Account** — equity, balance, free margin, margin level, drawdown
+4. **Market Snapshot** — live bid/ask/spread, current EST time
+5. **Technical Indicators** — ATR-M15, RSI-M15, D1, MACD histogram, M15 momentum bias
+6. **Original Trade Thesis** — full rationale, invalidation, risk note (up to 300 chars)
+7. **Theory Invalidation Check** (non-loss phases only) — placed immediately after the thesis so the model evaluates invalidation before reading portfolio/news context
+8. **Portfolio Context** — other open positions with USD-direction bucket and risk %
+9. **Recent Market Context** (`_build_job2_news_context`):
    - Last 8 scored headlines for this pair today
    - Released economic events today with actual/forecast/surprise (ForexFactory)
    - Session prices for 5 assets: symbol + DXY + US10Y + Gold + VIX
    This replaces the former `build_context()[:2000]` truncation, which was designed
    for signal generation (7-day summaries, full price tables) — not position management.
-8. **Phase Assessment** — phase-specific question block (see below)
-9. **Theory Invalidation Check** (non-loss phases only — see dedicated section)
+10. **Phase Assessment** — phase-specific question block (see below)
+
+JSON output schema adds three explicit per-dimension fields:
+
+```json
+{
+  "thesis_status": "intact | weakened | broken",
+  "move_character": "noise | directional",
+  "news_assessment": "neutral | supporting | opposing",
+  "action": "Hold | Trim | Exit | SetSL | SetTP | SetSLTP",
+  "confidence": "High | Medium | Low",
+  "rationale": "2-3 sentences referencing specific position and market data",
+  ...
+}
+```
+
+`thesis_status`, `move_character`, and `news_assessment` force the model to commit to an explicit verdict on each dimension before outputting the final action, making the reasoning auditable and reducing action-rationalisation.
 
 #### Phase-specific prompt design
 
@@ -1122,6 +1165,8 @@ Allowed actions: "Hold", "Exit", or "Trim" (with suggested_trim_pct 25-75).
 
 Fires at every non-loss phase (EARLY, BREAKEVEN, PROFIT, TRAIL, OVERDUE). Suppressed in loss phases because the loss-phase question blocks already explicitly ask about thesis validity — running both would double-prompt the model toward Exit on what might be normal noise.
 
+The section is placed immediately after `=== ORIGINAL TRADE THESIS ===` in the prompt, before portfolio context and recent news. This ordering ensures the model evaluates whether the thesis is broken while that thesis is fresh in context, rather than after being primed by adverse news.
+
 ```
 === THEORY INVALIDATION CHECK ===
 Original invalidation condition: Close below 1.2680 (SMA20)
@@ -1147,8 +1192,13 @@ For positions opened manually (no journal entry): the model defaults to `theory_
 
 The priority Sonnet LLM JSON output includes `theory_invalidated` and `theory_invalidation_reason` fields in all phases. The `reasoning_summary` in the routine prompt serves an analogous purpose for auditability.
 
+Full priority JSON schema:
+
 ```json
 {
+  "thesis_status": "intact | weakened | broken",
+  "move_character": "noise | directional",
+  "news_assessment": "neutral | supporting | opposing",
   "action": "Trim | Hold | Exit | SetSL | SetTP | SetSLTP",
   "confidence": "High | Medium | Low",
   "rationale": "2-3 sentences referencing specific position and market data",
@@ -1174,9 +1224,9 @@ The priority Sonnet LLM JSON output includes `theory_invalidated` and `theory_in
 | Breakeven SL (auto) | Phase engine | `modify_sl_tp()` direct | 🔒 Auto Breakeven | None |
 | Trail SL (auto) | Phase engine | `modify_sl_tp()` direct | 🔒 Auto Trail SL | None |
 
-Routine Hold notifications (`_notify_routine_hold`) are compact single-line messages:
+Routine Hold notifications (`_notify_routine_hold`) are compact single-line messages that now include `thesis_alignment`:
 ```
-🕐 Routine #12345678 BUY EURUSD | +$23.40 | 0.87R | EARLY | Hold [Medium] — RSI-M15 neutral at 52, no adverse headlines today, R within expected range for EARLY phase
+🕐 Routine #12345678 BUY EURUSD | +$23.40 | 0.87R | EARLY | Hold [Medium] | thesis=supporting — RSI-M15 neutral at 52, no adverse headlines today, R within expected range for EARLY phase
 ```
 
 ---
@@ -1480,8 +1530,8 @@ class _SafeRotatingFileHandler(RotatingFileHandler):
 | Signal debate judge (CIO) | `analysis/ensemble_agent.py` | Claude Sonnet 4.6 | Synthesis, scoring, and SL/TP adjustment; quality matters more than speed here |
 | Position debate personas (Hold/Exit/Devil's Advocate) | `analysis/ensemble_agent.py` | Azure GPT-5.2 → Claude Haiku 4.5 fallback | Same `_gather_personas_async` path as signal debate; Devil focuses on cognitive bias (sunk-cost, fear) |
 | Position debate judge | `analysis/ensemble_agent.py` | Claude Sonnet 4.6 | Same judge path as signal debate |
-| Position monitor — routine 30-min check | `agents/job2_position.py` | Azure GPT-5.2 → Claude Haiku 4.5 fallback | Cost-efficient routine scan; 600-token prompt with news + indicators + reasoning_summary |
-| Position monitor — priority / phase transition | `agents/job2_position.py` | Claude Sonnet 4.6 (`ANALYSIS_MODEL`) | Full enriched prompt; theory invalidation; risk management accuracy matters |
+| Position monitor — routine 30-min check | `agents/job2_position.py` | Azure GPT-5.2 → Claude Haiku 4.5 fallback | Questions-first prompt; derived metrics; thesis_alignment + news_impact fields; requires_full_analysis escalation |
+| Position monitor — priority / phase transition | `agents/job2_position.py` | Claude Sonnet 4.6 + extended thinking (3K budget) | Full enriched prompt; derived metrics; theory invalidation after thesis; thesis_status + move_character + news_assessment fields |
 | Daily summary generation | `pipeline/daily_collector.py` | Claude Sonnet 4.6 (`ANALYSIS_MODEL`) | User-facing; quality matters |
 | CB policy extraction | `pipeline/cb_policy_updater.py` | Claude Haiku 4.5 (`TRIAGE_MODEL`) | Structured JSON extraction; Haiku is sufficient |
 | Chat assistant (Job 4) | `agents/job4_chat.py` | Claude Sonnet 4.6 (`ANALYSIS_MODEL`) | Conversational + tool calling; quality matters |

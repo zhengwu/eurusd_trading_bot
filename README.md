@@ -137,9 +137,19 @@ Job 2 runs as two coordinated background threads:
 
 #### Two-tier LLM analysis
 
-**Routine checks (Azure GPT-5.2 / Haiku fallback):** Every 30-minute pass uses a compact prompt that includes technical indicators, today's session prices, and the last 6 scored headlines for the pair. The model assesses indicator alignment, news impact, and phase fit and returns a `reasoning_summary` (auditable chain-of-thought) plus an action. If it recommends Exit with High confidence, it automatically escalates to full Sonnet.
+**Routine checks (Azure GPT-5.2 / Haiku fallback):** Every 30-minute pass uses a compact prompt designed to maximize output quality at low cost:
+- **Questions-first layout** — assessment questions appear at the top before data sections, so the model reads what to look for before it sees the numbers
+- **Pre-computed derived metrics** — ATR-M15 in pips, directional threshold (2× ATR), and hours remaining are pre-calculated and labelled; no arithmetic required from the model
+- **Structured output fields** — `thesis_alignment` (supporting/neutral/opposing) and `news_impact` (none/minor/significant_adverse/significant_supportive) force explicit per-dimension verdicts alongside the `reasoning_summary`
+- **Smart escalation** — the model can set `requires_full_analysis=true` to trigger a Sonnet deep-dive without committing to an Exit recommendation; the fallback `Exit [High]` path remains
 
-**Priority analysis (Claude Sonnet):** Fires on phase transitions (watcher) or escalation from the routine check. Uses a targeted context block — last 8 scored headlines, released economic events with actual/forecast/surprise, and session prices — rather than the full signal-generation context. Includes a **theory invalidation cross-cutting check** at every non-loss phase: if the macro catalyst that opened the trade has been definitively reversed (e.g., original thesis was ECB hawkish hold → ECB just cut unexpectedly), the model forces an Exit overriding any phase-based Hold recommendation.
+The compact Slack notification now shows thesis alignment: `Hold [Medium] | thesis=supporting — …`
+
+**Priority analysis (Claude Sonnet + extended thinking):** Fires on phase transitions (watcher) or escalation from the routine check. Extended thinking (3K token budget) allows step-by-step reasoning before the final JSON output. Prompt improvements in this tier:
+- **Derived metrics block** — same pre-computed ATR/threshold/time-remaining as routine
+- **Theory invalidation placed after the thesis** — the model sees the original invalidation condition before reading portfolio or news context, preventing adverse news from anchoring the invalidation judgement
+- **Structured output fields** — `thesis_status` (intact/weakened/broken), `move_character` (noise/directional), and `news_assessment` (neutral/supporting/opposing) expose reasoning that would otherwise be buried in the rationale text
+- **Targeted context block** — last 8 headlines, released economic events with actual/forecast/surprise, and session prices for 5 assets — not the full signal-generation context (7-day summaries, full price tables)
 
 #### Phase engine (hard rules, no LLM)
 
