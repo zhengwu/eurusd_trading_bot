@@ -517,6 +517,47 @@ def _fmt_original_signal(original: dict | None) -> str:
     )
 
 
+# ── theory invalidation check ────────────────────────────────────────────────
+
+def _build_invalidation_block(original: dict | None, phase_info: dict) -> str:
+    """
+    Build the cross-cutting theory invalidation section for the LLM prompt.
+    Fires at every phase so profit phases also catch thesis reversals.
+    """
+    phase     = phase_info["phase"]
+    current_r = phase_info["current_r"]
+    r_str     = f"{current_r:.2f}R" if current_r is not None else "unknown R"
+
+    if not original:
+        return (
+            "No original thesis available (position may have been opened manually or thesis not recorded).\n"
+            "Set theory_invalidated=true ONLY if price action alone is clearly catastrophic "
+            "(e.g., price has blown through where the stop should be, or a major macro reversal "
+            "is underway that would invalidate any thesis in this direction).\n"
+            "Default to theory_invalidated=false when uncertain about a manual position."
+        )
+
+    inv_condition = original.get("invalidation") or "(not specified)"
+    rationale_snippet = (original.get("rationale") or "")[:200]
+
+    return (
+        f"Original invalidation condition: {inv_condition}\n"
+        f"Original thesis summary: {rationale_snippet}\n"
+        f"Current position: {phase.upper()} at {r_str}\n\n"
+        "Thesis is INVALIDATED if ANY of these apply:\n"
+        "  1. Price has convincingly closed beyond the stated invalidation level\n"
+        "  2. A news/macro event has directly and definitively reversed the original catalyst\n"
+        "     (e.g., original thesis was 'ECB hawkish hold' → ECB just cut rates unexpectedly)\n"
+        "  3. The structural setup has been negated (e.g., cited support/resistance fully broken)\n\n"
+        "Thesis is NOT invalidated by:\n"
+        "  - Normal pullbacks or noise within ATR range\n"
+        "  - Temporary adverse moves that haven't breached key levels\n"
+        "  - Broad uncertainty without a specific thesis reversal\n\n"
+        "Set theory_invalidated=true only when you are confident the thesis is definitively broken.\n"
+        "If true, your action MUST be Exit — this overrides phase-based logic."
+    )
+
+
 # ── phase-specific prompts ────────────────────────────────────────────────────
 
 def _build_prompt(
@@ -683,6 +724,8 @@ def _build_prompt(
         )
         allowed_actions = '"Hold", "Exit", or "Trim".'
 
+    invalidation_block = _build_invalidation_block(original, phase_info)
+
     prompt = f"""\
 You are managing an open {display} position. Review all data below and provide a
 recommendation to protect capital and optimise the trade outcome.
@@ -713,6 +756,9 @@ recommendation to protect capital and optimise the trade outcome.
 Current phase: {phase.upper()}
 {phase_block}
 
+=== THEORY INVALIDATION CHECK ===
+{invalidation_block}
+
 Provide your recommendation as JSON:
 {{
   "action": "Hold | Trim | Exit | SetSL | SetTP | SetSLTP",
@@ -721,13 +767,17 @@ Provide your recommendation as JSON:
   "risk_note": "Any immediate risks to the position",
   "suggested_sl": null,
   "suggested_tp": null,
-  "suggested_trim_pct": null
+  "suggested_trim_pct": null,
+  "theory_invalidated": false,
+  "theory_invalidation_reason": ""
 }}
 
 Rules:
 - Allowed actions for this phase: {allowed_actions}
 - suggested_sl / suggested_tp: float prices or null
 - suggested_trim_pct: integer 1-100 (% of position to close), or null
+- theory_invalidated: true only if the original thesis is definitively broken (see check above)
+- theory_invalidation_reason: 1 sentence explaining what specifically was invalidated, or empty
 - Return ONLY valid JSON, no other text."""
 
     return prompt
@@ -798,6 +848,8 @@ def _build_trigger(pos: dict, rec: dict, phase_info: dict) -> dict[str, Any]:
     action     = rec.get("action", "Hold")
     r_str      = f" | {phase_info['current_r']:.2f}R" if phase_info["current_r"] is not None else ""
     emoji_map  = {"Exit": "🚨", "Trim": "✂️", "Hold": "✅", "SetSL": "🔒", "SetTP": "🎯", "SetSLTP": "🔒🎯"}
+    if rec.get("_theory_override"):
+        emoji_map["Exit"] = "💡🚨"  # theory-driven exit distinct from drawdown exit
     return {
         "headline": (
             f"{emoji_map.get(action, '')} Position Monitor — #{pos.get('ticket')} "
@@ -934,6 +986,23 @@ def analyze_position(pos: dict, portfolio: dict) -> dict[str, Any] | None:
     rec = _call_llm(prompt, symbol)
     if rec is None:
         return None
+
+    # Theory invalidation override — if thesis definitively broken, force Exit
+    # regardless of the phase-based action (e.g., a trailing trade where news
+    # just reversed the macro catalyst should exit even if technically in profit)
+    if rec.get("theory_invalidated") is True and rec.get("action") != "Exit":
+        original_action = rec.get("action", "Hold")
+        reason = rec.get("theory_invalidation_reason") or "(see rationale)"
+        logger.warning(
+            f"#{ticket} [{phase_info['phase']}] Theory invalidated — "
+            f"overriding {original_action} → Exit. Reason: {reason}"
+        )
+        rec["action"]           = "Exit"
+        rec["_theory_override"] = True
+        rec["rationale"]        = (
+            f"[THESIS INVALIDATED — overriding {original_action}] "
+            + rec.get("rationale", "")
+        )
 
     rec["ticket"]     = ticket
     rec["source"]     = "job2"
