@@ -70,7 +70,8 @@ def format_signal(raw: dict[str, Any]) -> dict[str, Any]:
         "today_summary": str(raw.get("today_summary", "")),
         "week_summary":  str(raw.get("week_summary", "")),
         "wait_reason":   str(raw.get("wait_reason", "")),
-        "theory_classification": str(raw.get("theory_classification", "")),
+        # raw value can be None (JSON null) when no positions exist; avoid str(None) = "None"
+        "theory_classification": str(raw.get("theory_classification") or ""),
         "related_ticket": related_ticket,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

@@ -265,12 +265,11 @@ def _run_pair_scan(symbol: str) -> list[dict]:
         context = build_context(symbol=symbol, trigger_item=trigger)
 
         # Inject open position theories so LLM can classify new vs continuation
+        # (get_open_position_theories handles the not-connected case internally)
         open_pos_context = ""
         try:
             from analysis.context_builder import get_open_position_theories
-            from mt5.connector import is_connected
-            if is_connected():
-                open_pos_context = get_open_position_theories(symbol)
+            open_pos_context = get_open_position_theories(symbol)
         except Exception as e:
             logger.warning(f"[{symbol}] Open position context failed (non-fatal): {e}")
 

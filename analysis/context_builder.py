@@ -363,7 +363,7 @@ def get_open_position_theories(symbol: str) -> str:
             entry     = pos["open_price"]
             sl        = pos["sl"] or "N/A"
             tp        = pos["tp"] or "N/A"
-            pnl_usd   = pos.get("profit", 0.0)
+            pnl_usd   = float(pos.get("profit") or 0.0)
             opened    = pos.get("open_time", "N/A")
 
             lines.append(f"Position #{i} — {direction}  Ticket: {ticket}")
