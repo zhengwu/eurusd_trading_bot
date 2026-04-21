@@ -259,6 +259,13 @@ JOB3_MIN_RR                  = 0.4    # Hard block: execution rejected below thi
 JOB3_RR_WARNING              = 1.0    # Soft warn: ⚠ shown in Slack preview below this R:R
 JOB3_SIGNAL_EXPIRY_MINUTES   = 60    # Signal auto-expires if not approved in time
 
+# ── Sizing Agent ──────────────────────────────────────────────────────────────
+SIZING_H4_BARS       = 100   # H4 bars to fetch for pivot detection
+SIZING_PIVOT_N       = 2     # Bars on each side required to confirm a pivot (2 = 5-bar pivot)
+SIZING_SL_ATR_BUFFER = 1.0   # ATR-H4 multiples to pad SL beyond the pivot level
+SIZING_TP_ATR_BUFFER = 0.3   # ATR-H4 multiples to set TP inside the pivot level
+SIZING_MIN_RR        = 1.5   # Minimum R:R for TP; if no pivot qualifies, use SL × this
+
 # Uncertainty-based lot sizing — risk % multipliers by uncertainty tier
 # uncertainty <= 30  → 1.00× (high conviction — full risk)
 # uncertainty <= 55  → 0.75× (medium conviction)

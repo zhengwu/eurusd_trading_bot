@@ -34,7 +34,7 @@ load_dotenv()
 import config
 from mt5.connector import connect, disconnect, is_connected
 from mt5.position_reader import get_current_tick, get_open_positions
-from mt5.risk_manager import calculate_lot_size, calculate_sl_tp, sl_pips_from_price
+from mt5.risk_manager import calculate_lot_size, calculate_sl_tp, sl_pips_from_price, recommend_position_size
 from mt5.order_manager import open_position, close_position, place_limit_order
 from pipeline.signal_store import (
     approve_signal,
@@ -97,28 +97,15 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
     # ── Job 1: open a new position ─────────────────────────────────────────
     if action in ("Long", "Short"):
         direction = "buy" if action == "Long" else "sell"
+        symbol    = signal.get("_symbol", config.MT5_SYMBOL)
 
-        symbol = signal.get("_symbol", config.MT5_SYMBOL)
-
-        # ── Portfolio risk gate ────────────────────────────────────────────
+        # ── Equity (needed for both lot sizing and portfolio gate) ─────────
         equity_pre = _get_equity()
-        if equity_pre is not None:
-            from mt5.portfolio_risk import check_portfolio_risk
-            risk_check = check_portfolio_risk(
-                direction, symbol, equity_pre,
-                new_risk_pct=signal.get("_recommended_risk_pct"),
-            )
-            if not risk_check["ok"]:
-                logger.warning(
-                    f"Portfolio risk blocked signal {signal.get('id', '?')}: "
-                    f"{risk_check['reason']}"
-                )
-                return {"ok": False, "error": f"Portfolio risk guard: {risk_check['reason']}"}
+        if equity_pre is None:
+            return {"ok": False, "error": "Cannot read account equity"}
 
+        # ── Price reference ────────────────────────────────────────────────
         limit_price = signal.get("_limit_price")
-
-        # For SL/TP and lot calculation, use limit price as reference if set,
-        # otherwise use the live tick.
         if limit_price:
             current_price = float(limit_price)
         else:
@@ -127,13 +114,13 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
                 return {"ok": False, "error": "No tick data available"}
             current_price = tick["ask"] if direction == "buy" else tick["bid"]
 
+        # ── SL / TP ────────────────────────────────────────────────────────
         sl_price, tp_price = calculate_sl_tp(signal, current_price, direction, symbol=symbol)
-
         sl_pips = sl_pips_from_price(sl_price, current_price, direction, symbol=symbol)
         if sl_pips < 1:
             sl_pips = config.JOB3_DEFAULT_SL_PIPS
 
-        # ── R:R gate ──────────────────────────────────────────────────────────
+        # ── R:R gate ───────────────────────────────────────────────────────
         if tp_price and sl_pips > 0:
             pip = config.PAIRS.get(symbol, config.PAIRS[config.MT5_SYMBOL])["pip"]
             tp_pips = abs(tp_price - current_price) / pip
@@ -147,15 +134,33 @@ def execute_signal(signal: dict[str, Any], trim_pct: float | None = None) -> dic
                 return {"ok": False, "error": msg}
             logger.info(f"[{symbol}] R:R {rr:.2f} — passed minimum {config.JOB3_MIN_RR}")
 
-        if equity_pre is None:
-            return {"ok": False, "error": "Cannot read account equity"}
+        # ── Lot sizing (fresh from live price + signal uncertainty) ────────
+        # _lot_override is only set by Job 4 (manual user override via chat).
+        # For all automated signals, recompute fresh here so lot and sl_pips
+        # are always derived from the same price reference.
+        manual_lot = signal.get("_lot_override")
+        if manual_lot:
+            lot             = float(manual_lot)
+            sizing_risk_pct = signal.get("_recommended_risk_pct", config.JOB3_RISK_PCT)
+            logger.info(f"[{symbol}] Lot sizing: manual override → {lot} lots")
+        else:
+            unc             = signal.get("uncertainty_score") or signal.get("_uncertainty_score")
+            sizing          = recommend_position_size(unc, equity_pre, sl_pips, symbol=symbol)
+            lot             = sizing["lot"]
+            sizing_risk_pct = sizing["risk_pct"]
+            logger.info(f"[{symbol}] Lot sizing: {sizing['reason']}")
 
-        lot = signal.get("_lot_override") or calculate_lot_size(
-            equity_pre, config.JOB3_RISK_PCT, sl_pips, symbol=symbol
+        # ── Portfolio risk gate (uses fresh sizing_risk_pct) ───────────────
+        from mt5.portfolio_risk import check_portfolio_risk
+        risk_check = check_portfolio_risk(
+            direction, symbol, equity_pre, new_risk_pct=sizing_risk_pct,
         )
-        logger.info(
-            f"[{symbol}] Lot sizing: {'recommended=' + str(signal.get('_lot_override')) if signal.get('_lot_override') else 'fallback (base ' + str(config.JOB3_RISK_PCT) + '%)'} → {lot} lots"
-        )
+        if not risk_check["ok"]:
+            logger.warning(
+                f"Portfolio risk blocked signal {signal.get('id', '?')}: "
+                f"{risk_check['reason']}"
+            )
+            return {"ok": False, "error": f"Portfolio risk guard: {risk_check['reason']}"}
 
         if limit_price:
             result = place_limit_order(
@@ -274,12 +279,17 @@ def compute_order_preview(signal: dict[str, Any], symbol: str | None = None) -> 
             sl_pips = config.JOB3_DEFAULT_SL_PIPS
 
         equity = _get_equity()
-        lot_override = signal.get("_lot_override")
-        if lot_override:
-            lot = float(lot_override)
+        # Manual _lot_override (set by Job 4 chat) takes precedence;
+        # otherwise compute fresh using uncertainty scaling so the preview
+        # matches what execute_signal() will do at approval time.
+        manual_lot = signal.get("_lot_override")
+        if manual_lot:
+            lot = float(manual_lot)
         else:
-            lot = calculate_lot_size(equity or 10000.0, config.JOB3_RISK_PCT, sl_pips, symbol=sym)
-        pip_value = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["pip_value_per_lot"]
+            unc    = signal.get("uncertainty_score") or signal.get("_uncertainty_score")
+            sizing = recommend_position_size(unc, equity or 10000.0, sl_pips, symbol=sym)
+            lot    = sizing["lot"]
+        pip_value   = config.PAIRS.get(sym, config.PAIRS[config.MT5_SYMBOL])["pip_value_per_lot"]
         risk_amount = round(lot * sl_pips * pip_value, 2)
 
         tp_pips = abs(tp_price - current_price) / pip if tp_price else None
