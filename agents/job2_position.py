@@ -812,7 +812,7 @@ Capture your conclusions across all four questions in "reasoning_summary".
 
 Return ONLY valid JSON:
 {{
-  "reasoning_summary": "4 short sentences (max 20 words each): thesis alignment, news impact, phase fit, escalation need",
+  "reasoning_summary": "4 short sentences: thesis alignment verdict, news impact verdict, phase fit verdict, escalation need verdict",
   "thesis_alignment": "supporting | neutral | opposing",
   "news_impact": "none | minor | significant_adverse | significant_supportive",
   "action": "Hold | Exit | Trim",
