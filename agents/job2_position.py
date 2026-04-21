@@ -812,7 +812,7 @@ Capture your conclusions across all four questions in "reasoning_summary".
 
 Return ONLY valid JSON:
 {{
-  "reasoning_summary": "4 short sentences: thesis alignment verdict, news impact verdict, phase fit verdict, escalation need verdict",
+  "reasoning_summary": "4 short sentences (max 20 words each): thesis alignment, news impact, phase fit, escalation need",
   "thesis_alignment": "supporting | neutral | opposing",
   "news_impact": "none | minor | significant_adverse | significant_supportive",
   "action": "Hold | Exit | Trim",
@@ -1115,19 +1115,19 @@ def _call_routine_llm(prompt: str, symbol: str) -> dict | None:
                 {"role": "system", "content": system},
                 {"role": "user",   "content": prompt},
             ],
-            max_tokens=500,
+            max_tokens=800,
         )
         raw = resp.choices[0].message.content.strip()
         logger.debug(f"Routine check [{symbol}]: Azure {deployment}")
     except Exception as az_err:
-        logger.debug(f"Azure routine unavailable ({az_err}) — Haiku fallback")
+        logger.warning(f"Azure routine unavailable [{symbol}] ({az_err}) — Haiku fallback")
 
     # ── Claude Haiku fallback ─────────────────────────────────────────────────
     if raw is None:
         try:
             msg = _get_client().messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=500,
+                max_tokens=800,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
             )
