@@ -1115,7 +1115,7 @@ def _call_routine_llm(prompt: str, symbol: str) -> dict | None:
                 {"role": "system", "content": system},
                 {"role": "user",   "content": prompt},
             ],
-            max_tokens=800,
+            max_completion_tokens=800,
         )
         raw = resp.choices[0].message.content.strip()
         logger.debug(f"Routine check [{symbol}]: Azure {deployment}")
