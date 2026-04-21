@@ -1396,7 +1396,12 @@ def _notify_routine_hold(pos: dict, rec: dict) -> None:
     phase      = rec.get("phase", "")
     current_r  = (rec.get("phase_info") or {}).get("current_r")
     r_str      = f" | {current_r:.2f}R" if current_r is not None else ""
-    rationale  = (rec.get("rationale") or "")[:120]
+    _rat_raw   = (rec.get("rationale") or "")
+    if len(_rat_raw) > 140:
+        _cut   = _rat_raw[:140].rsplit(" ", 1)[0]
+        rationale = _cut + "…"
+    else:
+        rationale = _rat_raw
     confidence = rec.get("confidence", "?")
 
     notify_text(
